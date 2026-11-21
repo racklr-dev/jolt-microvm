@@ -1,0 +1,10 @@
+{:paths ["src"]
+ :deps {jolt-lang/http-client
+        {:git/url "https://github.com/jolt-lang/http-client"
+         :git/sha "03267126e0bebe172936e9618b9ff6cd678edaac"}
+        jolt-lang/jolt-oci
+        {:git/url "https://github.com/racklr-dev/jolt-oci"
+         :git/sha "021ec7c5133cffc0f7f2858efa7657d9ae82e1ee"}
+        jolt-lang/jolt-libkrun
+        {:git/url "https://github.com/racklr-dev/jolt-libkrun"
+         :git/sha "94662805ad24bb77567af457d78cebb11eebf5f0"}}}
