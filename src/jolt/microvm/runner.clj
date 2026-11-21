@@ -33,7 +33,10 @@
           (ffi/write p :ulong cur 0)
           (when-not (zero? (c-setrlimit rlimit-nofile p))
             (throw (ex-info "setrlimit(RLIMIT_NOFILE) failed" {:errno (ffi/errno)})))
-          (str "RLIMIT_NOFILE=" cur ":" capped))
+          ;; libkrun 1.19.6's init parses the rlimit ID with strtoull, so a
+          ;; NAME ("RLIMIT_NOFILE=...") parses as 0 = RLIMIT_CPU, which sets the
+          ;; CPU limit to 0 and SIGKILLs the guest. Pass the NUMERIC id: 7.
+          (str "7=" cur ":" capped))
         (finally (ffi/free p))))))
 
 (defn -main [& args]
