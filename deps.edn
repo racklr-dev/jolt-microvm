@@ -7,4 +7,4 @@
          :git/sha "021ec7c5133cffc0f7f2858efa7657d9ae82e1ee"}
         jolt-lang/jolt-libkrun
         {:git/url "https://github.com/racklr-dev/jolt-libkrun"
-         :git/sha "94662805ad24bb77567af457d78cebb11eebf5f0"}}}
+         :git/sha "ee51814b46494d376db622f08d5d3a48f903ca9d"}}}

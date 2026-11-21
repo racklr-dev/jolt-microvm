@@ -20,7 +20,11 @@ to [jolt](https://github.com/jolt-lang/jolt).
 (vm/exec v "echo hi > /workspace/x.txt")
 (slurp "/tmp/ws/x.txt")           ; => "hi\n"
 
+(vm/save-snapshot! v "pre-upgrade")
+(vm/reboot! v)                      ; stop + fresh start; in-VM changes discarded
 (vm/stop! v)
+(vm/restore-snapshot! v "pre-upgrade")  ; replaces cached base
+(vm/delete-snapshot! v "pre-upgrade")
 ```
 
 ## How it works
@@ -49,11 +53,18 @@ to [jolt](https://github.com/jolt-lang/jolt).
 
 ## Modules
 
-- `jolt.microvm` — `start!` / `exec` / `stop!` (subprocess runner + SSH).
-- `jolt.microvm.rootfs` — `base!`, `prepare!`, `install-alpine-packages!`,
+- `jolt.microvm` — `start!` / `exec` / `stop!` / `save-snapshot!` /
+  `list-snapshots` / `restore-snapshot!` / `delete-snapshot!` / `reboot!`,
+  plus macOS `dyld-fallback-path` and `ensure-hypervisor-entitlement!`.
+- `jolt.microvm.rootfs` — `base!`, `prepare!`, `install-alpine-packages!`
+  (chowns the apk-installed base back to the user), `cp-r!`, `cleanup!`,
   user/key/krun-config injection.
 - `jolt.microvm.keys` — ephemeral + host ed25519 keys via `ssh-keygen`.
-- `jolt.microvm.runner` — the subprocess `-main` that blocks in `boot!`.
+- `jolt.microvm.runner` — the subprocess `-main` that caps `RLIMIT_NOFILE`
+  (getrlimit/setrlimit) and blocks in `boot!` with `krun_set_rlimits`.
+
+Sibling: [jolt-pty](https://github.com/racklr-dev/jolt-pty) has the reusable
+POSIX pseudo-terminal primitives (the PTY core of dirge's pty_harness.rs).
 
 ## License
 

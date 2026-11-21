@@ -6,7 +6,31 @@
             [clojure.java.shell :as shell])
   (:import [java.nio.file Files Paths LinkOption StandardCopyOption CopyOption]))
 
-(defn- image-safe [image] (str/replace image #"[/:]" "_"))
+(defn image-safe [image] (str/replace image #"[/:]" "_"))
+
+(defn cached-base-path
+  "Path to the cached base rootfs for an image + cache dir."
+  [image cache-dir]
+  (str cache-dir "/" (image-safe image) "/base"))
+
+(declare copy-tree!)
+
+(defn cp-r!
+  "Recursively copy a directory tree, preserving symlinks and file modes."
+  [src dst]
+  (.mkdirs (java.io.File. dst))
+  (copy-tree! src dst)
+  dst)
+
+(defn cleanup!
+  "Remove a directory tree if it exists (no-op otherwise)."
+  [path]
+  (let [f (java.io.File. path)]
+    (when (.exists f)
+      (let [r (shell/sh "rm" "-rf" "--" path)]
+        (when-not (zero? (:exit r))
+          (throw (ex-info "rm -rf failed" {:path path :stderr (:err r)})))))
+    nil))
 
 (defn- copy-tree! [src dst]
   (let [s (java.io.File. src)]
@@ -64,6 +88,14 @@
                   apk "--root" rootfs "--no-cache" "--allow-untrusted" "add" packages)]
       (when-not (zero? (:exit r))
         (throw (ex-info "apk add failed" {:stderr (:err r)})))
+      ;; apk runs as root and creates root-owned files; chown them back to the
+      ;; invoking user so clone/snapshot/restore/cleanup need no sudo, and
+      ;; sshd still works because the krun config passes -o StrictModes=no.
+      (let [uid (str/trim (:out (shell/sh "id" "-u")))
+            gid (str/trim (:out (shell/sh "id" "-g")))
+            c (shell/sh "sudo" "chown" "-R" (str uid ":" gid) rootfs)]
+        (when-not (zero? (:exit c))
+          (throw (ex-info "chown after apk failed" {:stderr (:err c)}))))
       :ok)))
 
 (defn inject-sandbox-user!
