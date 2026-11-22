@@ -75,13 +75,22 @@
     (copy-tree! base session)
     session))
 
+(defn musl-loader
+  "Path to the musl dynamic loader inside an alpine rootfs, or nil."
+  [rootfs]
+  (let [d (java.io.File. (str rootfs "/lib"))]
+    (some (fn [f]
+            (when (str/starts-with? (.getName f) "ld-musl-")
+              (.getAbsolutePath f)))
+          (or (seq (.listFiles d)) []))))
+
 (defn install-alpine-packages!
   "Install apk packages into an alpine rootfs using its own apk + musl loader.
   (No buildah/docker needed on the host.) Returns :ok."
   [rootfs & packages]
-  (let [loader (str rootfs "/lib/ld-musl-x86_64.so.1")
+  (let [loader (musl-loader rootfs)
         apk (str rootfs "/sbin/apk")]
-    (when-not (.exists (java.io.File. loader))
+    (when-not loader
       (throw (ex-info "not an alpine rootfs (no musl loader)" {:rootfs rootfs})))
     (let [r (apply shell/sh "sudo" loader "--library-path"
                   (str rootfs "/lib:" rootfs "/usr/lib")

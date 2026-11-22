@@ -1,13 +1,88 @@
 ;; jolt.microvm — run commands inside an OCI-image-backed libkrun microVM
 ;; over SSH (port of dirge's sandbox/microvm: runner.rs, rootfs.rs, ssh.rs).
+;;
+;; Plug-and-play: start! auto-seeds sshd into the cached alpine base (file-locked),
+;; runs a pre-flight dependency check, and throws a readable error listing
+;; what is missing. exec has a hard wall-clock timeout so a hung guest command
+;; cannot wedge the host library.
 (ns jolt.microvm
   (:require [jolt.microvm.keys :as keys]
             [jolt.microvm.rootfs :as rootfs]
+            [jolt.libkrun.probe :as probe]
             [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [clojure.data.json :as json])
   (:import [java.net Socket InetSocketAddress]
-           [java.io File]))
+           [java.io File ByteArrayOutputStream]))
 
+;; -- pre-flight --------------------------------------------------------------
+(defn- which
+  "Absolute path of a command on PATH, or nil."
+  [cmd]
+  (let [r (shell/sh "sh" "-c" (str "command -v " cmd " 2>/dev/null || true"))]
+    (let [p (str/trim (:out r))]
+      (when (seq p) p))))
+
+(defn check!
+  "Pre-flight dependency check for jolt-microvm. Returns
+  {:ok? boolean :results [{:name :status :message :fix}]} with
+  :status in :ok/:warn/:error. Call it directly for a report, or let start!
+  do it and throw on :error."
+  []
+  (let [lk (probe/find-libkrun)
+        lkfw (probe/find-libkrunfw)
+        kvm-present (probe/kvm-present?)
+        kvm-writable (probe/kvm-available?)
+        ssh (which "ssh")
+        keygen (which "ssh-keygen")
+        sudo (which "sudo")
+        jolt (or (System/getenv "JOLT_BIN")
+                 (str (System/getProperty "user.home") "/.local/bin/jolt"))
+        results
+        [{:name :libkrun :status (if lk :ok :error)
+          :message (or lk "libkrun shared library not found")
+          :fix (when-not lk "install libkrun (e.g. brew install libkrun, or dnf/apt install libkrun)")}
+         {:name :libkrunfw :status (if lkfw :ok :error)
+          :message (or lkfw "libkrunfw shared library not found")
+          :fix (when-not lkfw "install libkrunfw (same package as libkrun on most distros)")}
+         {:name :kvm
+          :status (cond (not kvm-present) :error kvm-writable :ok :else :error)
+          :message (if (not kvm-present)
+                     "/dev/kvm not present"
+                     (if kvm-writable "/dev/kvm read+write ok" "/dev/kvm exists but is not writable"))
+          :fix (if (not kvm-present)
+                 "enable KVM in BIOS/host and load the kvm module"
+                 "add your user to the kvm group: sudo usermod -aG kvm $USER, then log out and back in")}
+         {:name :ssh :status (if ssh :ok :error)
+          :message (or ssh "openssh client not found")
+          :fix (when-not ssh "install openssh-client")}
+         {:name :ssh-keygen :status (if keygen :ok :error)
+          :message (or keygen "ssh-keygen not found")
+          :fix (when-not keygen "install openssh-client")}
+         {:name :sudo :status (if sudo :ok :warn)
+          :message (or sudo "sudo not found (needed only to auto-seed alpine sshd)")
+          :fix (when-not sudo "install sudo, or pre-seed sshd into the cached base yourself")}
+         {:name :jolt-bin :status (if (.exists (java.io.File. jolt)) :ok :error)
+          :message (if (.exists (java.io.File. jolt)) jolt (str "jolt binary not at " jolt))
+          :fix (if-not (.exists (java.io.File. jolt))
+                 "set JOLT_BIN to the jolt binary (the runner is spawned as a jolt subprocess)" nil)}]
+        ok? (every? #(not= :error (:status %)) results)]
+    {:ok? ok? :results results}))
+
+(defn- check-or-throw!
+  []
+  (let [{:keys [ok? results]} (check!)]
+    (when-not ok?
+      (let [errors (filter #(= :error (:status %)) results)]
+        (throw (ex-info
+                (str "jolt-microvm pre-flight failed: "
+                     (str/join " | "
+                               (map #(str (name (:name %)) " — " (:message %)
+                                          (when (:fix %) (str " [fix: " (:fix %) "]")))
+                                    errors)))
+                {:check-results results}))))))
+
+;; -- ssh ---------------------------------------------------------------------
 (defn wait-for-ssh!
   "Connect and read the SSH banner to confirm sshd is serving.
   Returns :ok or throws after timeout-ms."
@@ -23,7 +98,7 @@
                                n (.read (.getInputStream s) buf)]
                            (.close s)
                            (if (and (pos? n)
-                                    (clojure.string/starts-with? (String. buf 0 n) "SSH-"))
+                                    (str/starts-with? (String. buf 0 n) "SSH-"))
                              :banner
                              :no-banner))
                          (catch Exception _ (.close s) :fail)))
@@ -34,24 +109,45 @@
           (throw (ex-info "timed out waiting for SSH" {:port port}))
           :else (do (Thread/sleep 100) (recur)))))))
 
+(defn- drain!
+  "Read an InputStream to EOF and return its bytes as a UTF-8 string."
+  [in]
+  (let [baos (ByteArrayOutputStream.)
+        buf (byte-array 8192)]
+    (loop []
+      (let [n (.read in buf)]
+        (when (pos? n)
+          (.write baos buf 0 n)
+          (recur))))
+    (String. (.toByteArray baos) "UTF-8")))
+
 (defn ssh-exec
   "Run command in the guest over SSH, verifying the injected host key.
-  Returns {:stdout :stderr :exit}."
-  [port private-key-path host-public-key command]
+  Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000)."
+  [port private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
   (let [known (str (System/getProperty "java.io.tmpdir") "/jolt-known-" (java.util.UUID/randomUUID))]
     (spit known (str "[127.0.0.1]:" port " " host-public-key "\n"))
     (try
-      (let [r (shell/sh "ssh" "-i" private-key-path
-                        "-p" (str port)
-                        "-o" "StrictHostKeyChecking=yes"
-                        "-o" (str "UserKnownHostsFile=" known)
-                        "-o" "BatchMode=yes"
-                        "-o" "ConnectTimeout=10"
-                        "-o" "LogLevel=ERROR"
-                        "sandbox@127.0.0.1" command)]
-        {:stdout (:out r) :stderr (:err r) :exit (:exit r)})
-      (finally (.delete (File. known))))))
+      (let [argv (into-array String ["ssh" "-i" private-key-path
+                                     "-p" (str port)
+                                     "-o" "StrictHostKeyChecking=yes"
+                                     "-o" (str "UserKnownHostsFile=" known)
+                                     "-o" "BatchMode=yes"
+                                     "-o" "ConnectTimeout=10"
+                                     "-o" "LogLevel=ERROR"
+                                     "sandbox@127.0.0.1" command])
+            proc (.start (ProcessBuilder. argv))
+            out (future (drain! (.getInputStream proc)))
+            err (future (drain! (.getErrorStream proc)))]
+        (if (.waitFor proc timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+          {:stdout @out :stderr @err :exit (.exitValue proc)}
+          (do (.destroyForcibly proc)
+              (future-cancel out)
+              (future-cancel err)
+              (throw (ex-info "ssh command timed out" {:command command :timeout-ms timeout-ms})))))
+      (finally (.delete (java.io.File. known))))))
 
+;; -- runner ------------------------------------------------------------------
 (defn- pick-port []
   (let [s (java.net.ServerSocket. 0)]
     (try (.getLocalPort s) (finally (.close s)))))
@@ -67,8 +163,6 @@
         _ (.directory pb (File. project-dir))
         env (.environment pb)
         _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
-        ;; macOS: libkrun.dylib dlopens libkrunfw by bare leaf name; give the
-        ;; subprocess the brew lib dirs so it always resolves.
         _ (when-let [dyld (dyld-fallback-path)]
             (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
         p (.start pb)]
@@ -76,13 +170,63 @@
 
 (defrecord VM [image cache-dir rootfs port private-key-path host-public-key process workspace opts])
 
+;; -- auto-seed ----------------------------------------------------------------
+(defn- with-base-lock! [path f]
+  "Run f while holding an atomic mkdir lock at path. Blocks if another process
+  holds it; breaks stale locks (from a crashed seeder) after 10 minutes."
+  (let [lock-dir (java.io.File. path)]
+    (.mkdirs (.getParentFile lock-dir))
+    (let [stale-ms 600000]
+      (loop []
+        (let [created? (try
+                         (java.nio.file.Files/createDirectory (.toPath lock-dir))
+                         true
+                         (catch Exception _ false))]
+          (cond
+            created?
+            (try (f)
+                 (finally (java.nio.file.Files/deleteIfExists (.toPath lock-dir))))
+
+            (> (- (System/currentTimeMillis) (.lastModified lock-dir)) stale-ms)
+            (do (java.nio.file.Files/deleteIfExists (.toPath lock-dir))
+                (recur))
+
+            :else
+            (do (Thread/sleep 100) (recur))))))))
+
+(defn- ensure-sshd!
+  "Make the cached base for image contain sshd, seeding it with apk if it is an
+  alpine-family image. Idempotent and safe under concurrent start!. Returns the
+  base path."
+  [image cache-dir]
+  (let [base (rootfs/base! image cache-dir)
+        sshd (str base "/usr/sbin/sshd")]
+    (when-not (.exists (java.io.File. sshd))
+      (with-base-lock!
+        (str cache-dir "/" (rootfs/image-safe image) "/.seed.lock")
+        (fn []
+          (when-not (.exists (java.io.File. sshd))
+            (if (rootfs/musl-loader base)
+              (rootfs/install-alpine-packages! base "openssh")
+              (throw (ex-info
+                      (str "image has no sshd and is not alpine-family (no musl loader to seed with). "
+                           "Use an alpine image, or an image with sshd already installed, or pre-seed the base.")
+                      {:image image :base base})))))))
+    base))
+
+;; -- lifecycle ----------------------------------------------------------------
 (defn start!
-  "Boot a microVM from an OCI image and wait for sshd.
+  "Boot a microVM from an OCI image and wait for sshd. Auto-seeds sshd into the
+  cached alpine base on first use. Runs check! first and throws a readable
+  error if any hard dependency is missing.
+
   opts: :image (required), :workspace, :cache-dir, :cpus, :memory-mib,
-        :ssh-port (0 = ephemeral), :project-dir (dir of deps.edn with the deps).
-  Returns a VM record."
+        :ssh-port (0 = ephemeral), :project-dir (dir whose deps.edn provides
+        jolt-microvm + its deps). Returns a VM record."
   [{:keys [image workspace cache-dir cpus memory-mib ssh-port project-dir] :as opts}]
+  (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
+        _ (ensure-sshd! image cache-dir)
         rootfs (rootfs/prepare! image cache-dir)
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
@@ -107,10 +251,12 @@
       (->VM image cache-dir rootfs port (:private-key-path ephemeral) (:public-key host) proc ws opts))))
 
 (defn exec
-  "Run a command in the VM. Returns {:stdout :stderr :exit}."
-  [vm command & {:keys [cwd] :or {cwd "/workspace"}}]
+  "Run a command in the VM. Returns {:stdout :stderr :exit}.
+  opts: :cwd (default /workspace), :timeout-ms (default 300000)."
+  [vm command & {:keys [cwd timeout-ms] :or {cwd "/workspace" timeout-ms 300000}}]
   (ssh-exec (:port vm) (:private-key-path vm) (:host-public-key vm)
-            (str "cd " cwd " && " command)))
+            (str "cd " cwd " && " command)
+            :timeout-ms timeout-ms))
 
 (defn stop!
   "Shut down the VM: graceful SSH poweroff, then destroy the runner process."
@@ -187,15 +333,15 @@
 
 ;; -- macOS helpers (untested on Linux; ported from mod.rs) -------------------
 (def ^:private macos?
-  (clojure.string/starts-with?
-    (clojure.string/lower-case (or (System/getProperty "os.name") ""))
+  (str/starts-with?
+    (str/lower-case (or (System/getProperty "os.name") ""))
     "mac"))
 
 (defn- brew-prefix
   ([package]
    (let [args (if package ["brew" "--prefix" package] ["brew" "--prefix"])
          r (apply shell/sh args)]
-     (when (zero? (:exit r)) (clojure.string/trim (:out r)))))
+     (when (zero? (:exit r)) (str/trim (:out r)))))
   ([] (brew-prefix nil)))
 
 (defn dyld-fallback-path
@@ -204,26 +350,24 @@
   or sane defaults. Returns nil on Linux."
   []
   (when macos?
-    (let [prefixes (distinct (remove clojure.string/blank?
-                                     [(brew-prefix "libkrunfw") (brew-prefix nil)]))
+    (let [prefixes (distinct (remove str/blank?
+                                     [(brew-prefix "libkrunfw") (brew-prefix)]))
           dirs (map #(str % "/lib") prefixes)
           existing (System/getenv "DYLD_FALLBACK_LIBRARY_PATH")]
-      (str (clojure.string/join ":" dirs)
-           (when (and existing (not (clojure.string/blank? existing)))
+      (str (str/join ":" dirs)
+           (when (and existing (not (str/blank? existing)))
              (str ":" existing))
            ":/usr/local/lib:/usr/lib"))))
 
 (defn ensure-hypervisor-entitlement!
   "On macOS, codesign the jolt binary with com.apple.security.hypervisor if it
-  lacks it (Hypervisor.framework requires the entitlement). No-op on Linux.
-  Deliberately does NOT use --options runtime (hardened runtime would strip
-  DYLD_FALLBACK_LIBRARY_PATH and break the libkrunfw lookup)."
+  lacks it (Hypervisor.framework requires the entitlement). No-op on Linux."
   []
   (when macos?
     (let [bin (jolt-bin)]
       (let [check (shell/sh "codesign" "-d" "--entitlements" "-" bin)]
-        (if (clojure.string/includes? (str (:out check) (:err check))
-                                     "com.apple.security.hypervisor")
+        (if (str/includes? (str (:out check) (:err check))
+                           "com.apple.security.hypervisor")
           :already-signed
           (let [tmp (str (System/getProperty "java.io.tmpdir") "/jolt-runner-entitlements.plist")]
             (spit tmp

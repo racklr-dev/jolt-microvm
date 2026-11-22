@@ -1,7 +1,7 @@
 ;; Snapshot + reboot integration test (port of dirge's snapshot/reboot tests).
+;; start! auto-seeds sshd; no manual apk step.
 (ns jolt.test.snapshot
   (:require [jolt.microvm :as vm]
-            [jolt.microvm.rootfs :as rootfs]
             [clojure.string :as str]))
 
 (def cache "/tmp/jolt-microvm-cache")
@@ -11,9 +11,6 @@
            :workspace workspace
            :cpus 1 :memory-mib 256
            :project-dir (System/getProperty "user.dir")})
-
-;; seed openssh once (idempotent: base! reuses; chown-back keeps it user-owned)
-(rootfs/install-alpine-packages! (rootfs/base! "alpine:3.20" cache) "openssh")
 
 ;; Boot 1: write a marker inside the VM, snapshot the rootfs.
 (def v (vm/start! opts))
