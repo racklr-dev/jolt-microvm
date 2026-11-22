@@ -381,6 +381,49 @@
                   :cache-dir (:cache-dir vm)
                   :arch (get-in vm [:opts :arch])))
 
+(defn run-image!
+  "One-shot: boot an image directly into a command (no SSH, no shell) and return
+  {:stdout :stderr :exit}. Works for distroless and any other image whose rootfs
+  contains the executable; no apk/sshd seeding happens. The guest command's
+  exit code is the returned :exit.
+
+  opts: :image (required), :cmd [exe arg...] (required), :arch, :cpus,
+        :memory-mib, :cache-dir, :project-dir, :timeout-ms."
+  [{:keys [image cmd arch cpus memory-mib cache-dir project-dir timeout-ms]}]
+  (check-or-throw!)
+  (when-not (seq cmd)
+    (throw (ex-info "run-image! needs :cmd [exe arg...]" {:image image})))
+  (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
+        rootfs (rootfs/prepare! image cache-dir arch)
+        cfg {"mode" "exec"
+             "rootfs_path" rootfs
+             "cpus" (or cpus 1)
+             "memory_mib" (or memory-mib 512)
+             "exec" (vec cmd)}
+        out-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-out-" (java.util.UUID/randomUUID))
+        err-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-err-" (java.util.UUID/randomUUID))
+        pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str cfg)])
+        _ (.directory pb (File. project-dir))
+        env (.environment pb)
+        _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
+        _ (when-let [dyld (dyld-fallback-path)]
+            (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
+        _ (.redirectOutput pb (File. out-file))
+        _ (.redirectError pb (File. err-file))
+        proc (.start pb)]
+    (if (.waitFor proc (or timeout-ms 300000) java.util.concurrent.TimeUnit/MILLISECONDS)
+      (let [exit (.exitValue proc)
+            out (if (.exists (File. out-file)) (slurp out-file) "")
+            err (if (.exists (File. err-file)) (slurp err-file) "")]
+        (.delete (File. out-file))
+        (.delete (File. err-file))
+        {:stdout out :stderr err :exit exit})
+      (do
+        (.destroyForcibly proc)
+        (.delete (File. out-file))
+        (.delete (File. err-file))
+        (throw (ex-info "VM command timed out" {:cmd cmd :timeout-ms timeout-ms}))))))
+
 (defn attach!
   "Attach an interactive SSH session to the running VM over an isolated pty
   (console relay). Blocks until the session exits; returns its exit status.

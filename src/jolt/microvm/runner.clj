@@ -46,13 +46,24 @@
         ssh-port (int (get cfg "ssh_port" 0))
         cpus (int (get cfg "cpus" 2))
         memory-mib (int (get cfg "memory_mib" 512))
-        rlimits (when-let [n (capped-nofile!)] [n])
-        virtiofs (or (seq (mapv (fn [m] [(get m "tag") (get m "host")]) (get cfg "mounts")))
-                     (when workspace [["workspace" workspace]]))]
-    (krun/boot! {:rootfs rootfs
-                 :workdir "/"
-                 :cpus cpus
-                 :memory-mib memory-mib
-                 :rlimits rlimits
-                 :port-map (when (pos? ssh-port) (str ssh-port ":22"))
-                 :virtiofs virtiofs})))
+        rlimits (when-let [n (capped-nofile!)] [n])]
+    (if (= "exec" (get cfg "mode"))
+      ;; Direct-exec: boot the guest command with no SSH/shell. krun_start_enter
+      ;; does not return on success — it exits this process with the guest's
+      ;; exit code, so the parent reads it from the subprocess exit status.
+      (krun/boot! {:rootfs rootfs
+                   :workdir "/"
+                   :cpus cpus
+                   :memory-mib memory-mib
+                   :rlimits rlimits
+                   :exec (vec (get cfg "exec"))})
+      ;; ssh mode: boot sshd with virtio-fs mounts and a port forward
+      (let [virtiofs (or (seq (mapv (fn [m] [(get m "tag") (get m "host")]) (get cfg "mounts")))
+                         (when workspace [["workspace" workspace]]))]
+        (krun/boot! {:rootfs rootfs
+                     :workdir "/"
+                     :cpus cpus
+                     :memory-mib memory-mib
+                     :rlimits rlimits
+                     :port-map (when (pos? ssh-port) (str ssh-port ":22"))
+                     :virtiofs virtiofs})))))

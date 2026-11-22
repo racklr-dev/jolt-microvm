@@ -167,6 +167,26 @@ console relay), [jolt-libkrun](https://github.com/racklr-dev/jolt-libkrun)
 (krun_* bindings + lib probe), [jolt-oci](https://github.com/racklr-dev/jolt-oci)
 (multi-arch OCI pull + unpack).
 
+## Direct-exec (distroless and shell-less images)
+
+`start!` is the SSH *session* mode — it seeds openssh, so it needs an alpine
+(apk) base or an image that already ships sshd. For distroless and other
+images with no shell/sshd, use `run-image!`, which boots the image straight
+into a command via `krun_set_exec` (no SSH) and returns the output:
+
+```clojure
+(vm/run-image! {:image "gcr.io/distroless/python3-debian12:latest"
+                :cmd ["/usr/bin/python3" "-c" "print('hi')"]
+                :cache-dir "/tmp/cache"
+                :project-dir "/path/to/your/project"})
+;; => {:stdout "hi\n" :stderr "" :exit 0}
+```
+
+`run-image!` is one-shot and blocking (with `:timeout-ms`); the guest's exit
+code is the returned `:exit`. It works for any image whose rootfs contains the
+executable — alpine with `/bin/sh`, distroless language images, or your own
+layered binary.
+
 ## License
 
 EPL-2.0
