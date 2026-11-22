@@ -46,7 +46,8 @@
         ssh-port (int (get cfg "ssh_port" 0))
         cpus (int (get cfg "cpus" 2))
         memory-mib (int (get cfg "memory_mib" 512))
-        rlimits (when-let [n (capped-nofile!)] [n])]
+        rlimits (when-let [n (capped-nofile!)] [n])
+        net-taps (mapv (fn [t] {:name (get t "name") :mac (get t "mac")}) (get cfg "net_taps"))]
     (if (= "exec" (get cfg "mode"))
       ;; Direct-exec: boot the guest command with no SSH/shell. krun_start_enter
       ;; does not return on success — it exits this process with the guest's
@@ -58,7 +59,8 @@
                    :memory-mib memory-mib
                    :rlimits rlimits
                    :exec (vec (get cfg "exec"))
-                   :port-map (get cfg "port_map")})
+                   :port-map (get cfg "port_map")
+                   :net-taps net-taps})
       ;; ssh mode: boot sshd with virtio-fs mounts and a port forward
       (let [virtiofs (or (seq (mapv (fn [m] [(get m "tag") (get m "host")]) (get cfg "mounts")))
                          (when workspace [["workspace" workspace]]))]
@@ -68,4 +70,5 @@
                      :memory-mib memory-mib
                      :rlimits rlimits
                      :port-map (when (pos? ssh-port) (str ssh-port ":22"))
+                     :net-taps net-taps
                      :virtiofs virtiofs})))))
