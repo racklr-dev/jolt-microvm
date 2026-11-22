@@ -3,7 +3,7 @@
 [![tests](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml)
 
 Run commands inside an OCI-image-backed [libkrun](https://github.com/containers/libkrun)
-microVM over SSH — a port of dirge's `sandbox/microvm` to
+microVM over SSH: a port of dirge's `sandbox/microvm` to
 [jolt](https://github.com/jolt-lang/jolt). Boot any alpine-based image (any
 language runtime, via `:packages`), mount host directories, run commands or a
 long-lived agent session over SSH, and snapshot the rootfs.
@@ -96,7 +96,7 @@ launched from for dependency resolution (`user.dir`).
 ## Volume mounts
 
 `:workspace` is the host dir mounted at `/workspace` (default
-`rootfs/workspace`). `:mounts` adds more, in any of three shapes:
+`rootfs/workspace`). `:mounts` adds more, in any of three forms:
 
 ```clojure
 {:mounts {"/host/a" "/a" "/host/b" "/b"}}   ; host->guest map
@@ -143,25 +143,25 @@ message. `:scp` and `:sudo` are warnings (copy helpers / auto-seed unavailable).
 
 - libkrun + libkrunfw (`libkrun.so` / `libkrun.dylib`).
 - Linux: `/dev/kvm` writable (user in the `kvm` group). **Keep your normal
-  primary gid** — `sg kvm` breaks virtio-fs guest writes; use a login shell or
+  primary gid**: `sg kvm` breaks virtio-fs guest writes; use a login shell or
   `setpriv --regid $(id -g) --groups kvm,...`.
 - `ssh`, `ssh-keygen` (and `scp` for copy helpers) on the host.
 - `sudo` only for the automatic alpine seed.
-- The jolt binary at `~/.local/bin/jolt` (or set `JOLT_BIN`) — the runner is a
+- The jolt binary at `~/.local/bin/jolt` (or set `JOLT_BIN`): the runner is a
   jolt subprocess.
 
 ## Modules
 
-- `jolt.microvm` — `check!`, `start!`/`exec`/`exec!`/`attach!`/`stop!`,
+- `jolt.microvm`: `check!`, `start!`/`exec`/`exec!`/`attach!`/`stop!`,
   `with-vm`, `alive?`, `info`, `copy-to!`/`copy-from!`,
   `install!`/`install-image!`, `save-snapshot!`/`list-snapshots`/
   `restore-snapshot!`/`delete-snapshot!`/`reboot!`, macOS helpers.
-- `jolt.microvm.cli` — the `jolt run -m` command-line interface.
-- `jolt.microvm.rootfs` — `base!`, `prepare!`, `musl-loader`,
+- `jolt.microvm.cli`: the `jolt run -m` command-line interface.
+- `jolt.microvm.rootfs`: `base!`, `prepare!`, `musl-loader`,
   `alpine-installed?`, `install-alpine-packages!`, `cp-r!`, `cleanup!`,
   user/key/krun-config injection, multi-mount config.
-- `jolt.microvm.keys` — ephemeral + host ed25519 keys via `ssh-keygen`.
-- `jolt.microvm.runner` — subprocess `-main` that caps `RLIMIT_NOFILE` and
+- `jolt.microvm.keys`: ephemeral + host ed25519 keys via `ssh-keygen`.
+- `jolt.microvm.runner`: subprocess `-main` that caps `RLIMIT_NOFILE` and
   blocks in `boot!` with all virtio-fs mounts.
 
 Siblings: [jolt-pty](https://github.com/racklr-dev/jolt-pty) (pty primitives +
@@ -171,7 +171,7 @@ console relay), [jolt-libkrun](https://github.com/racklr-dev/jolt-libkrun)
 
 ## Direct-exec (distroless and shell-less images)
 
-`start!` is the SSH *session* mode — it seeds openssh, so it needs an alpine
+`start!` is the SSH *session* mode: it seeds openssh, so it needs an alpine
 (apk) base or an image that already ships sshd. For distroless and other
 images with no shell/sshd, use `run-image!`, which boots the image straight
 into a command via `krun_set_exec` (no SSH) and returns the output:
@@ -186,7 +186,7 @@ into a command via `krun_set_exec` (no SSH) and returns the output:
 
 `run-image!` is one-shot and blocking (with `:timeout-ms`); the guest's exit
 code is the returned `:exit`. It works for any image whose rootfs contains the
-executable — alpine with `/bin/sh`, distroless language images, or your own
+executable: alpine with `/bin/sh`, distroless language images, or your own
 layered binary.
 
 ## License
