@@ -1,4 +1,9 @@
-{:paths ["src"]
+{;; jolt-microvm drives libkrun (by-value FFI) through jolt-libkrun and the
+ ;; jolt-exec guest deps, so it floors at the same 0.8.28 as the rest of the
+ ;; sandbox stack.
+ :jolt/min-version "0.8.28"
+
+ :paths ["src"]
  :deps {jolt-lang/http-client
         {:git/url "https://github.com/jolt-lang/http-client"
          :git/sha "03267126e0bebe172936e9618b9ff6cd678edaac"}
@@ -7,7 +12,7 @@
          :git/sha "9e4afdf314c0870e8d67b5adb55a31643d5c59b3"}
         jolt-lang/jolt-libkrun
         {:git/url "https://github.com/racklr-dev/jolt-libkrun"
-         :git/sha "4f738b7af3369e998c0d7df9ce51e0f4e62f58ca"}
+         :git/sha "d4bf0c543eb6b476cf9f0188ae43e998466e6dd6"}
         jolt-lang/jolt-pty
         {:git/url "https://github.com/racklr-dev/jolt-pty"
          :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}
@@ -16,4 +21,6 @@
          :git/sha "6cc6032504762c4b4867278e502421e96bd10cd8"}
         jolt-lang/jolt-tapmasq
         {:git/url "https://github.com/racklr-dev/jolt-tapmasq"
-         :git/sha "c9f2d12c72c937087e12195145e6cf301527680b"}}}
+         :git/sha "56c0fa5e964a5cbc79bf33b1610d86cd2fb454f8"}}
+
+ :tasks {test "jolt run test/jolt/check_test.clj"}}

@@ -1,5 +1,7 @@
 # jolt-microvm
 
+[![tests](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml)
+
 Run commands inside an OCI-image-backed [libkrun](https://github.com/containers/libkrun)
 microVM over SSH — a port of dirge's `sandbox/microvm` to
 [jolt](https://github.com/jolt-lang/jolt). Boot any alpine-based image (any
