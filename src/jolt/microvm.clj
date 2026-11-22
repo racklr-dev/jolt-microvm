@@ -388,12 +388,14 @@
   exit code is the returned :exit.
 
   opts: :image (required), :cmd [exe arg...] (required), :arch, :cpus,
-        :memory-mib, :cache-dir, :project-dir, :timeout-ms."
-  [{:keys [image cmd arch cpus memory-mib cache-dir project-dir timeout-ms]}]
+        :memory-mib, :cache-dir, :project-dir, :timeout-ms, :packages (apk
+        packages to seed into an alpine base before boot)."
+  [{:keys [image cmd arch cpus memory-mib cache-dir project-dir timeout-ms packages]}]
   (check-or-throw!)
   (when-not (seq cmd)
     (throw (ex-info "run-image! needs :cmd [exe arg...]" {:image image})))
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
+        _ (when (seq packages) (ensure-base! image cache-dir packages arch))
         rootfs (rootfs/prepare! image cache-dir arch)
         cfg {"mode" "exec"
              "rootfs_path" rootfs
