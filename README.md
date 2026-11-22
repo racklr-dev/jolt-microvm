@@ -175,7 +175,7 @@ images with no shell/sshd, use `run-image!`, which boots the image straight
 into a command via `krun_set_exec` (no SSH) and returns the output:
 
 ```clojure
-(vm/run-image! {:image "gcr.io/distroless/python3-debian12:latest"
+(vm/run-image! {:image "gcr.io/distroless/python3-debian13:latest"
                 :cmd ["/usr/bin/python3" "-c" "print('hi')"]
                 :cache-dir "/tmp/cache"
                 :project-dir "/path/to/your/project"})

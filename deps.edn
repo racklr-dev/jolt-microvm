@@ -4,10 +4,10 @@
          :git/sha "03267126e0bebe172936e9618b9ff6cd678edaac"}
         jolt-lang/jolt-oci
         {:git/url "https://github.com/racklr-dev/jolt-oci"
-         :git/sha "b316289aa68b5731287f224ac42585ba35565a0c"}
+         :git/sha "9e4afdf314c0870e8d67b5adb55a31643d5c59b3"}
         jolt-lang/jolt-libkrun
         {:git/url "https://github.com/racklr-dev/jolt-libkrun"
-         :git/sha "69eac3d17c2f696a6e6887165edfe7158a833218"}
+         :git/sha "1c38e781b3a56e996489ddba3311ea22d05efe1d"}
         jolt-lang/jolt-pty
         {:git/url "https://github.com/racklr-dev/jolt-pty"
          :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}}}
