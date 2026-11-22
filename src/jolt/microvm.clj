@@ -10,6 +10,9 @@
             [jolt.microvm.rootfs :as rootfs]
             [jolt.libkrun.probe :as probe]
             [jolt.pty :as pty]
+            [jolt.exec.client :as exec-client]
+            [jolt.exec.bundle :as exec-bundle]
+            [jolt.microvm.deps :as guest-deps]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.data.json :as json])
@@ -291,7 +294,9 @@
            packages mounts arch] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
-        _ (ensure-base! image cache-dir packages arch)
+        declared (when project-dir (guest-deps/guest-deps project-dir))
+        _ (ensure-base! image cache-dir
+                        (distinct (concat packages (:apk declared))) arch)
         rootfs (rootfs/prepare! image cache-dir arch)
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
@@ -437,6 +442,86 @@
         (.delete (File. out-file))
         (.delete (File. err-file))
         (throw (ex-info "VM command timed out" {:cmd cmd :timeout-ms timeout-ms}))))))
+
+(defn- wait-for-tcp! [port timeout-ms]
+  (let [start (System/currentTimeMillis)]
+    (loop []
+      (let [ok? (try
+                  (let [s (Socket.)]
+                    (try
+                      (.connect s (InetSocketAddress. "127.0.0.1" port) 500)
+                      true
+                      (finally (.close s))))
+                  (catch Exception _ false))]
+        (cond
+          ok? :ok
+          (> (- (System/currentTimeMillis) start) timeout-ms)
+          (throw (ex-info "timed out waiting for daemon port" {:port port}))
+          :else (do (Thread/sleep 50) (recur)))))))
+
+(defn start-daemon!
+  "Boot a glibc image with the jolt-exec daemon as its entrypoint (no SSH/shell),
+  forward a host port to the daemon, and wait until it accepts connections.
+  Returns {:port :rootfs :process :image :daemon-port}. Run commands with
+  daemon-exec / daemon-run (or jolt.exec.client directly).
+
+  opts: :image (glibc image, e.g. gcr.io/distroless/python3-debian13),
+  :daemon-binary (path to the compiled exec-daemon), :daemon-port (guest port,
+  default 8080), :ssh-port (host port, default ephemeral), :arch, :cpus,
+  :memory-mib, :cache-dir, :project-dir."
+  [{:keys [image daemon-binary daemon-port ssh-port arch cpus memory-mib cache-dir project-dir]}]
+  (check-or-throw!)
+  (when-not (and daemon-binary (.exists (java.io.File. daemon-binary)))
+    (throw (ex-info "daemon-binary not found — build it: jolt build -m jolt.exec.daemon -o exec-daemon"
+                    {:daemon-binary daemon-binary})))
+  (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
+        rootfs (rootfs/prepare! image cache-dir arch)
+        guest-port (or daemon-port 8080)
+        guest-exe (exec-bundle/bundle-daemon! daemon-binary rootfs
+                                    :shared-libs (:shared-libs (guest-deps/guest-deps project-dir)))
+        host-port (or ssh-port (pick-port))
+        cfg {"mode" "exec"
+             "rootfs_path" rootfs
+             "cpus" (or cpus 2)
+             "memory_mib" (or memory-mib 512)
+             "exec" [guest-exe (str guest-port)]
+             "port_map" (str host-port ":" guest-port)}
+        out-file (str (System/getProperty "java.io.tmpdir") "/jolt-daemon-out-" (java.util.UUID/randomUUID))
+        err-file (str (System/getProperty "java.io.tmpdir") "/jolt-daemon-err-" (java.util.UUID/randomUUID))
+        pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str cfg)])
+        _ (.directory pb (File. project-dir))
+        env (.environment pb)
+        _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
+        _ (when-let [dyld (dyld-fallback-path)]
+            (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
+        _ (.redirectOutput pb (File. out-file))
+        _ (.redirectError pb (File. err-file))
+        proc (.start pb)]
+    (try
+      (wait-for-tcp! host-port 30000)
+      (catch Exception e
+        (let [err (if (.exists (File. err-file)) (slurp err-file) "")
+              out (if (.exists (File. out-file)) (slurp out-file) "")]
+          (.destroyForcibly proc)
+          (throw (ex-info (str "daemon did not become reachable; runner out/err:\n" out "\n" err)
+                          {:port host-port :runner-out out :runner-err err})))))
+    {:port host-port :rootfs rootfs :process proc :image image :daemon-port guest-port :err-file err-file}))
+
+(defn daemon-exec
+  "Run a shell command via the in-guest exec daemon. Returns {:stdout :stderr :exit}."
+  [d command & {:keys [cwd timeout-ms] :or {cwd "/" timeout-ms 30000}}]
+  (exec-client/sh (:port d) command :cwd cwd :timeout-ms timeout-ms))
+
+(defn daemon-run
+  "Run a direct argv (no shell) via the in-guest exec daemon. distroless-safe."
+  [d argv & {:keys [cwd timeout-ms] :or {cwd "/" timeout-ms 30000}}]
+  (exec-client/run (:port d) argv :cwd cwd :timeout-ms timeout-ms))
+
+(defn stop-daemon!
+  "Stop a daemon-mode VM (the runner process is the guest's lifetime)."
+  [d]
+  (when (.isAlive (:process d)) (.destroyForcibly (:process d)))
+  :stopped)
 
 (defn attach!
   "Attach an interactive SSH session to the running VM over an isolated pty

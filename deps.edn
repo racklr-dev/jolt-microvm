@@ -10,4 +10,7 @@
          :git/sha "1c38e781b3a56e996489ddba3311ea22d05efe1d"}
         jolt-lang/jolt-pty
         {:git/url "https://github.com/racklr-dev/jolt-pty"
-         :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}}}
+         :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}
+        jolt-lang/jolt-exec
+        {:git/url "https://github.com/racklr-dev/jolt-exec"
+         :git/sha "6cc6032504762c4b4867278e502421e96bd10cd8"}}}
