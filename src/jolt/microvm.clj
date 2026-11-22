@@ -292,7 +292,8 @@
   (locking net-lock
     (let [seq (swap! net-seq inc)
           tap (str "jolt" seq)
-          host-cidr (format "10.44.%d.1/24" seq)
+          host-ip (format "10.44.%d.1" seq)
+          host-cidr (str host-ip "/24")
           config-file (str cache-dir "/dnsmasq-" seq ".conf")
           pid-file (str cache-dir "/dnsmasq-" seq ".pid")
           lease-file (str cache-dir "/dnsmasq-" seq ".leases")
@@ -303,7 +304,7 @@
       (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
                                              :range-start (format "10.44.%d.10" seq)
                                              :range-end (format "10.44.%d.100" seq)
-                                             :dns host-cidr}))
+                                             :dns host-ip}))
       (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
                            :lease-file lease-file :log-file log-file})
       {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq)
