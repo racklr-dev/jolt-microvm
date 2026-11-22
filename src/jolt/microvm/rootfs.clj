@@ -78,7 +78,7 @@
   [image cache-dir & [arch]]
   (let [dir (image-dir image cache-dir arch)
         base (base! image cache-dir arch)
-        session (str dir "/session-" (System/currentTimeMillis))]
+        session (str dir "/session-" (System/nanoTime))]
     (.mkdirs (java.io.File. session))
     (copy-tree! base session)
     session))

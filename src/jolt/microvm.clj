@@ -276,7 +276,14 @@
     (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
 
 ;; -- networking helpers ------------------------------------------------------
-(def ^:private *tap-seq* (atom 0))
+(def ^:private net-state
+  "Host-wide shared TAP + dnsmasq for every VM. libkrun 2.0 has no per-VM
+  port-map, so all VMs on this host share one /24 subnet and one DHCP server.
+  Refcounted: the first live VM creates the tap + dnsmasq, the last one tears
+  them down, so concurrent start!/stop! calls are safe."
+  (atom {:refs 0 :tap nil :mac-seq 0 :lease-file nil}))
+
+(def ^:private net-lock (Object.))
 
 (defn- mac-bytes [seq]
   (byte-array [2 0 0 0 0 (mod seq 255)]))
@@ -285,28 +292,42 @@
   (format "02:00:00:00:00:%02x" (mod seq 255)))
 
 (defn- net-up! [cache-dir]
-  "Create the TAP + dnsmasq for one VM. Returns {:tap :mac-str :mac-bytes :lease-file}."
-  (let [seq (swap! *tap-seq* inc)
-        tap "jolt0"
-        host-cidr "192.168.44.1/24"
-        config-file (str cache-dir "/dnsmasq.conf")
-        pid-file (str cache-dir "/dnsmasq.pid")
-        lease-file (str cache-dir "/dnsmasq.leases")
-        log-file (str cache-dir "/dnsmasq.log")]
-    (.mkdirs (java.io.File. cache-dir))
-    (net/tap-create! tap)
-    (net/tap-ip! tap host-cidr)
-    (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
-                                           :range-start "192.168.44.10"
-                                           :range-end "192.168.44.100"
-                                           :dns "192.168.44.1"}))
-    (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
-                         :lease-file lease-file :log-file log-file})
-    {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq) :lease-file lease-file}))
+  "Attach one VM to the shared TAP + dnsmasq, creating them on first use.
+  Returns {:tap :mac-str :mac-bytes :lease-file} with a unique MAC per VM."
+  (locking net-lock
+    (if (pos? (:refs @net-state))
+      (let [ns (swap! net-state (fn [s] (-> s (update :refs inc)
+                                             (update :mac-seq inc))))]
+        {:tap (:tap ns)
+         :mac-str (mac-str (:mac-seq ns))
+         :mac-bytes (mac-bytes (:mac-seq ns))
+         :lease-file (:lease-file ns)})
+      (let [tap "jolt0"
+            host-cidr "192.168.44.1/24"
+            config-file (str cache-dir "/dnsmasq.conf")
+            pid-file (str cache-dir "/dnsmasq.pid")
+            lease-file (str cache-dir "/dnsmasq.leases")
+            log-file (str cache-dir "/dnsmasq.log")]
+        (.mkdirs (java.io.File. cache-dir))
+        (net/tap-create! tap)
+        (net/tap-ip! tap host-cidr)
+        (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
+                                               :range-start "192.168.44.10"
+                                               :range-end "192.168.44.100"
+                                               :dns "192.168.44.1"}))
+        (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
+                             :lease-file lease-file :log-file log-file})
+        (reset! net-state {:refs 1 :tap tap :mac-seq 1 :lease-file lease-file})
+        {:tap tap :mac-str (mac-str 1) :mac-bytes (mac-bytes 1) :lease-file lease-file}))))
 
 (defn- net-down! [vm]
-  (net/dnsmasq-stop!)
-  (net/tap-delete! (:tap vm))
+  "Detach one VM; the last one tears the shared TAP + dnsmasq down."
+  (locking net-lock
+    (let [s (swap! net-state update :refs dec)]
+      (when (and (zero? (:refs s)) (:tap s))
+        (net/dnsmasq-stop!)
+        (net/tap-delete! (:tap s))
+        (reset! net-state {:refs 0 :tap nil :mac-seq 0 :lease-file nil}))))
   :stopped)
 
 (defn start!
