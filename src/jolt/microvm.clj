@@ -13,6 +13,7 @@
             [jolt.exec.client :as exec-client]
             [jolt.exec.bundle :as exec-bundle]
             [jolt.microvm.deps :as guest-deps]
+            [jolt.tapmasq :as net]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.data.json :as json])
@@ -130,38 +131,35 @@
     (String. (.toByteArray baos) "UTF-8")))
 
 (defn- known-hosts-path!
-  "Write a one-off known_hosts pinning the guest host key to 127.0.0.1:port.
-  Returns the file path; caller deletes it when done."
-  [port host-public-key]
+  "Write a one-off known_hosts pinning the guest host key to host:22."
+  [host host-public-key]
   (let [known (str (System/getProperty "java.io.tmpdir") "/jolt-known-" (java.util.UUID/randomUUID))]
-    (spit known (str "[127.0.0.1]:" port " " host-public-key "\n"))
+    (spit known (str host " " host-public-key "\n"))
     known))
 
-(defn- ssh-control-path [port]
-  (str (System/getProperty "java.io.tmpdir") "/jolt-ssh-ctl-" port))
+(defn- ssh-control-path [host]
+  (str (System/getProperty "java.io.tmpdir") "/jolt-ssh-ctl-" host))
 
-(defn- ssh-mux-args [port]
+(defn- ssh-mux-args [host]
   ["-o" "ControlMaster=auto"
-   "-o" (str "ControlPath=" (ssh-control-path port))
+   "-o" (str "ControlPath=" (ssh-control-path host))
    "-o" "ControlPersist=120"])
 
 (defn ssh-exec
-  "Run command in the guest over SSH, verifying the injected host key.
-  Reuses a persistent SSH connection (ControlMaster) keyed by port so repeated
-  execs skip the handshake. Returns {:stdout :stderr :exit}.
-  opts: :timeout-ms (default 300000)."
-  [port private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
-  (let [known (known-hosts-path! port host-public-key)]
+  "Run command in the guest over SSH, verifying the injected host key. host is
+  the guest's IP. Reuses a persistent SSH connection (ControlMaster) keyed by
+  host. Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000)."
+  [host private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
+  (let [known (known-hosts-path! host host-public-key)]
     (try
       (let [argv (into-array String (concat ["ssh" "-i" private-key-path
-                                             "-p" (str port)
                                              "-o" "StrictHostKeyChecking=yes"
                                              "-o" (str "UserKnownHostsFile=" known)
                                              "-o" "BatchMode=yes"
                                              "-o" "ConnectTimeout=10"
                                              "-o" "LogLevel=ERROR"]
-                                            (ssh-mux-args port)
-                                            ["sandbox@127.0.0.1" command]))
+                                            (ssh-mux-args host)
+                                            [(str "sandbox@" host) command]))
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
             err (future (drain! (.getErrorStream proc)))]
@@ -183,18 +181,22 @@
       (str (System/getProperty "user.home") "/.local/bin/jolt")))
 
 (declare dyld-fallback-path)
+(declare wait-for-tcp!)
 
 (defn- spawn-runner! [project-dir config]
   (let [pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str config)])
         _ (.directory pb (File. project-dir))
         env (.environment pb)
         _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
+        _ (when-let [dir (or (System/getenv "JOLT_LIBKRUN_DIR") "/tmp/libkrun/target/release")]
+            (.put env "LD_LIBRARY_PATH"
+                  (str dir (when-let [e (.get env "LD_LIBRARY_PATH")] (str ":" e)))))
         _ (when-let [dyld (dyld-fallback-path)]
             (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs port private-key-path host-public-key process workspace opts mounts])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -273,6 +275,40 @@
                      (range) user)]
     (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
 
+;; -- networking helpers ------------------------------------------------------
+(def ^:private *tap-seq* (atom 0))
+
+(defn- mac-bytes [seq]
+  (byte-array [2 0 0 0 0 (mod seq 255)]))
+
+(defn- mac-str [seq]
+  (format "02:00:00:00:00:%02x" (mod seq 255)))
+
+(defn- net-up! [cache-dir]
+  "Create the TAP + dnsmasq for one VM. Returns {:tap :mac-str :mac-bytes :lease-file}."
+  (let [seq (swap! *tap-seq* inc)
+        tap "jolt0"
+        host-cidr "192.168.44.1/24"
+        config-file (str cache-dir "/dnsmasq.conf")
+        pid-file (str cache-dir "/dnsmasq.pid")
+        lease-file (str cache-dir "/dnsmasq.leases")
+        log-file (str cache-dir "/dnsmasq.log")]
+    (.mkdirs (java.io.File. cache-dir))
+    (net/tap-create! tap)
+    (net/tap-ip! tap host-cidr)
+    (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
+                                           :range-start "192.168.44.10"
+                                           :range-end "192.168.44.100"
+                                           :dns "192.168.44.1"}))
+    (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
+                         :lease-file lease-file :log-file log-file})
+    {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq) :lease-file lease-file}))
+
+(defn- net-down! [vm]
+  (net/dnsmasq-stop!)
+  (net/tap-delete! (:tap vm))
+  :stopped)
+
 (defn start!
   "Boot a microVM from an OCI image and wait for sshd. Auto-seeds openssh (and
   any :packages) into the cached alpine base on first use. Runs check! first.
@@ -290,42 +326,45 @@
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib ssh-port project-dir
-           packages mounts arch] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
-        _ (ensure-base! image cache-dir
-                        (distinct (concat packages (:apk declared))) arch)
+        _ (ensure-base! image cache-dir (distinct (concat packages (:apk declared))) arch)
         rootfs (rootfs/prepare! image cache-dir arch)
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
         mounts (normalize-mounts ws mounts)
         ephemeral (keys/generate-ephemeral!)
-        host (keys/generate-host!)]
-    (rootfs/inject-sandbox-user! rootfs)
-    (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral))
-    (keys/inject-host! rootfs host)
-    (rootfs/write-krun-config! rootfs :mounts mounts)
-    (let [port (or ssh-port (pick-port))
-          cfg {"rootfs_path" rootfs
-               "ssh_port" port
-               "cpus" (or cpus 2)
-               "memory_mib" (or memory-mib 512)
-               "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m) "guest" (:guest m)}) mounts)}
-          proc (spawn-runner! project-dir cfg)]
-      (try
-        (wait-for-ssh! port 30000)
-        (catch Exception e
-          (.destroyForcibly proc)
-          (throw e)))
-      (->VM image cache-dir rootfs port (:private-key-path ephemeral) (:public-key host) proc ws opts mounts))))
+        host (keys/generate-host!)
+        _ (rootfs/inject-sandbox-user! rootfs)
+        _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral))
+        _ (keys/inject-host! rootfs host)
+        net (net-up! cache-dir)
+        exec-cmd (rootfs/sshd-exec-command mounts)
+        cfg {"rootfs_path" rootfs
+             "cpus" (or cpus 2)
+             "memory_mib" (or memory-mib 512)
+             "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m)}) mounts)
+             "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
+             "exec" exec-cmd
+             "dhcp" true}
+        proc (spawn-runner! project-dir cfg)]
+    (try
+      (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
+            _ (wait-for-tcp! ip 22 30000)]
+        (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
+              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net)))
+      (catch Exception e
+        (.destroyForcibly proc)
+        (net-down! {:tap (:tap net)})
+        (throw e)))))
 
 (defn exec
   "Run a command in the VM. Returns {:stdout :stderr :exit}.
   opts: :cwd (default /workspace), :timeout-ms (default 300000)."
   [vm command & {:keys [cwd timeout-ms] :or {cwd "/workspace" timeout-ms 300000}}]
-  (ssh-exec (:port vm) (:private-key-path vm) (:host-public-key vm)
+  (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm)
             (str "cd " cwd " && " command)
             :timeout-ms timeout-ms))
 
@@ -347,7 +386,7 @@
   "Describe a VM: {:image :port :rootfs :workspace :mounts :running?}."
   [vm]
   {:image (:image vm)
-   :port (:port vm)
+   :port (:ip vm)
    :rootfs (:rootfs vm)
    :workspace (:workspace vm)
    :mounts (:mounts vm)
@@ -356,15 +395,15 @@
 (defn- scp
   "Run scp against the VM with the host key pinned. Returns {:stdout :stderr :exit}."
   [vm & args]
-  (let [known (known-hosts-path! (:port vm) (:host-public-key vm))]
+  (let [known (known-hosts-path! (:ip vm) (:host-public-key vm))]
     (try
       (let [argv (into-array String (concat ["scp" "-i" (:private-key-path vm)
-                                             "-P" (str (:port vm))
+                                             "-P" "22"
                                              "-o" "StrictHostKeyChecking=yes"
                                              "-o" (str "UserKnownHostsFile=" known)
                                              "-o" "BatchMode=yes"
                                              "-o" "LogLevel=ERROR"]
-                                            (ssh-mux-args (:port vm))
+                                            (ssh-mux-args (:ip vm))
                                             args))
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
@@ -425,6 +464,9 @@
         _ (.directory pb (File. project-dir))
         env (.environment pb)
         _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
+        _ (when-let [dir (or (System/getenv "JOLT_LIBKRUN_DIR") "/tmp/libkrun/target/release")]
+            (.put env "LD_LIBRARY_PATH"
+                  (str dir (when-let [e (.get env "LD_LIBRARY_PATH")] (str ":" e)))))
         _ (when-let [dyld (dyld-fallback-path)]
             (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
         _ (.redirectOutput pb (File. out-file))
@@ -443,20 +485,20 @@
         (.delete (File. err-file))
         (throw (ex-info "VM command timed out" {:cmd cmd :timeout-ms timeout-ms}))))))
 
-(defn- wait-for-tcp! [port timeout-ms]
+(defn- wait-for-tcp! [host port timeout-ms]
   (let [start (System/currentTimeMillis)]
     (loop []
       (let [ok? (try
                   (let [s (Socket.)]
                     (try
-                      (.connect s (InetSocketAddress. "127.0.0.1" port) 500)
+                      (.connect s (InetSocketAddress. host port) 500)
                       true
                       (finally (.close s))))
                   (catch Exception _ false))]
         (cond
           ok? :ok
           (> (- (System/currentTimeMillis) start) timeout-ms)
-          (throw (ex-info "timed out waiting for daemon port" {:port port}))
+          (throw (ex-info "timed out waiting for port" {:host host :port port}))
           :else (do (Thread/sleep 50) (recur)))))))
 
 (defn start-daemon!
@@ -469,7 +511,7 @@
   :daemon-binary (path to the compiled exec-daemon), :daemon-port (guest port,
   default 8080), :ssh-port (host port, default ephemeral), :arch, :cpus,
   :memory-mib, :cache-dir, :project-dir."
-  [{:keys [image daemon-binary daemon-port ssh-port arch cpus memory-mib cache-dir project-dir]}]
+  [{:keys [image daemon-binary daemon-port arch cpus memory-mib cache-dir project-dir]}]
   (check-or-throw!)
   (when-not (and daemon-binary (.exists (java.io.File. daemon-binary)))
     (throw (ex-info "daemon-binary not found — build it: jolt build -m jolt.exec.daemon -o exec-daemon"
@@ -479,48 +521,41 @@
         guest-port (or daemon-port 8080)
         guest-exe (exec-bundle/bundle-daemon! daemon-binary rootfs
                                     :shared-libs (:shared-libs (guest-deps/guest-deps project-dir)))
-        host-port (or ssh-port (pick-port))
-        cfg {"mode" "exec"
-             "rootfs_path" rootfs
+        net (net-up! cache-dir)
+        cfg {"rootfs_path" rootfs
              "cpus" (or cpus 2)
              "memory_mib" (or memory-mib 512)
              "exec" [guest-exe (str guest-port)]
-             "port_map" (str host-port ":" guest-port)}
-        out-file (str (System/getProperty "java.io.tmpdir") "/jolt-daemon-out-" (java.util.UUID/randomUUID))
-        err-file (str (System/getProperty "java.io.tmpdir") "/jolt-daemon-err-" (java.util.UUID/randomUUID))
-        pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str cfg)])
-        _ (.directory pb (File. project-dir))
-        env (.environment pb)
-        _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
-        _ (when-let [dyld (dyld-fallback-path)]
-            (.put env "DYLD_FALLBACK_LIBRARY_PATH" dyld))
-        _ (.redirectOutput pb (File. out-file))
-        _ (.redirectError pb (File. err-file))
-        proc (.start pb)]
+             "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
+             "dhcp" true}
+        proc (spawn-runner! project-dir cfg)]
     (try
-      (wait-for-tcp! host-port 30000)
+      (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)]
+        (wait-for-tcp! ip guest-port 30000)
+        {:ip ip :rootfs rootfs :process proc :image image :daemon-port guest-port
+         :tap (:tap net) :lease-file (:lease-file net)})
       (catch Exception e
-        (let [err (if (.exists (File. err-file)) (slurp err-file) "")
-              out (if (.exists (File. out-file)) (slurp out-file) "")]
-          (.destroyForcibly proc)
-          (throw (ex-info (str "daemon did not become reachable; runner out/err:\n" out "\n" err)
-                          {:port host-port :runner-out out :runner-err err})))))
-    {:port host-port :rootfs rootfs :process proc :image image :daemon-port guest-port :err-file err-file}))
+        (.destroyForcibly proc)
+        (net-down! {:tap (:tap net)})
+        (throw e)))))
 
 (defn daemon-exec
   "Run a shell command via the in-guest exec daemon. Returns {:stdout :stderr :exit}."
   [d command & {:keys [cwd timeout-ms] :or {cwd "/" timeout-ms 30000}}]
-  (exec-client/sh (:port d) command :cwd cwd :timeout-ms timeout-ms))
+  (exec-client/exec (:ip d) (:daemon-port d)
+                    {"cmd" command "cwd" cwd "timeout_ms" timeout-ms}))
 
 (defn daemon-run
   "Run a direct argv (no shell) via the in-guest exec daemon. distroless-safe."
   [d argv & {:keys [cwd timeout-ms] :or {cwd "/" timeout-ms 30000}}]
-  (exec-client/run (:port d) argv :cwd cwd :timeout-ms timeout-ms))
+  (exec-client/exec (:ip d) (:daemon-port d)
+                    {"argv" (vec argv) "cwd" cwd "timeout_ms" timeout-ms}))
 
 (defn stop-daemon!
   "Stop a daemon-mode VM (the runner process is the guest's lifetime)."
   [d]
   (when (.isAlive (:process d)) (.destroyForcibly (:process d)))
+  (net-down! {:tap (:tap d)})
   :stopped)
 
 (defn attach!
@@ -529,7 +564,7 @@
   The guest host key is pinned, and the host terminal size is applied to the
   pty."
   [vm]
-  (let [known (known-hosts-path! (:port vm) (:host-public-key vm))
+  (let [known (known-hosts-path! (:ip vm) (:host-public-key vm))
         p (pty/open-pty!)]
     (try
       ;; Raw secondary: no local echo/canonical, so ssh requests ECHO=0 remotely
@@ -537,13 +572,13 @@
       (pty/make-raw! (:secondary-fd p))
       (let [child (pty/spawn-secondary!
                    p ["ssh" "-i" (:private-key-path vm)
-                      "-p" (str (:port vm))
+                      "-p" "22"
                       "-o" "StrictHostKeyChecking=yes"
                       "-o" (str "UserKnownHostsFile=" known)
                       "-o" "BatchMode=yes"
                       "-o" "LogLevel=ERROR"
                       "-t"
-                      "sandbox@127.0.0.1"])]
+                      (str "sandbox@" (:ip vm))])]
         (pty/relay! p child))
       (finally
         (pty/close-pty! p)
@@ -553,7 +588,7 @@
   "Shut down the VM: graceful SSH poweroff, then destroy the runner process."
   [vm]
   (try
-    (ssh-exec (:port vm) (:private-key-path vm) (:host-public-key vm) "poweroff -f")
+    (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm) "poweroff -f")
     (catch Exception _ nil))
   (Thread/sleep 1000)
   (when (.isAlive (:process vm))
@@ -561,12 +596,7 @@
   (Thread/sleep 200)
   (when (.isAlive (:process vm))
     (.destroyForcibly (:process vm)))
-  ;; tear down the persistent SSH control socket for this port (best-effort)
-  (try
-    (shell/sh "ssh" "-O" "exit"
-              "-o" (str "ControlPath=" (ssh-control-path (:port vm)))
-              "sandbox@127.0.0.1")
-    (catch Exception _ nil))
+  (net-down! vm)
   :stopped)
 
 (defmacro with-vm

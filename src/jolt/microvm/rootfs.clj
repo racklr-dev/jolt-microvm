@@ -145,18 +145,16 @@
       (.setWritable sshd true true)
       (spit (str dir "/authorized_keys") (str pubkey "\n")))))
 
-(defn write-krun-config!
-  "Write /.krun_config.json so libkrun's built-in init launches sshd with each
-  mount tagged and mounted at its guest path. mounts: [{:tag :host :guest}]."
-  [rootfs & {:keys [sshd mounts] :or {sshd "/usr/sbin/sshd" mounts []}}]
-  (let [mkdirs (str/join " && " (map #(str "mkdir -p " (:guest %)) mounts))
-        mount-cmds (str/join " && " (map #(str "mount -t virtiofs " (:tag %) " " (:guest %)) mounts))
+(defn sshd-exec-command
+  "Build the guest workload args (shell) that mount the virtio-fs tags and run
+  sshd. mounts: [{:tag :host :guest}]."
+  [mounts & {:keys [sshd] :or {sshd "/usr/sbin/sshd"}}]
+  (let [mount-cmds (str/join " && "
+                             (map #(str "mkdir -p " (:guest %) " && mount -t virtiofs "
+                                        (:tag %) " " (:guest %))
+                                  mounts))
         cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"
-                 (when (seq mkdirs) (str " && " mkdirs))
                  (when (seq mount-cmds) (str " && " mount-cmds))
                  " && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
-                 "&& exec " sshd " -D -e -o StrictModes=no")
-        cfg {"Cmd" ["/bin/sh" "-c" cmd]
-             "Env" []
-             "WorkingDir" "/"}]
-    (spit (str rootfs "/.krun_config.json") (json/write-str cfg))))
+                 "&& exec " sshd " -D -e -o StrictModes=no")]
+    ["/bin/sh" "-c" cmd]))
