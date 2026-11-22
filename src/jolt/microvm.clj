@@ -196,7 +196,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -276,13 +276,7 @@
     (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
 
 ;; -- networking helpers ------------------------------------------------------
-(def ^:private net-state
-  "Host-wide shared TAP + dnsmasq for every VM. libkrun 2.0 has no per-VM
-  port-map, so all VMs on this host share one /24 subnet and one DHCP server.
-  Refcounted: the first live VM creates the tap + dnsmasq, the last one tears
-  them down, so concurrent start!/stop! calls are safe."
-  (atom {:refs 0 :tap nil :mac-seq 0 :lease-file nil}))
-
+(def ^:private net-seq (atom 0))
 (def ^:private net-lock (Object.))
 
 (defn- mac-bytes [seq]
@@ -292,42 +286,33 @@
   (format "02:00:00:00:00:%02x" (mod seq 255)))
 
 (defn- net-up! [cache-dir]
-  "Attach one VM to the shared TAP + dnsmasq, creating them on first use.
-  Returns {:tap :mac-str :mac-bytes :lease-file} with a unique MAC per VM."
+  "Create one VM's own TAP + dnsmasq on its own /24 subnet (10.44.<n>.1/24),
+  so concurrent start! calls multiplex without fighting over a shared device.
+  Returns {:tap :mac-str :mac-bytes :lease-file :pid-file}."
   (locking net-lock
-    (if (pos? (:refs @net-state))
-      (let [ns (swap! net-state (fn [s] (-> s (update :refs inc)
-                                             (update :mac-seq inc))))]
-        {:tap (:tap ns)
-         :mac-str (mac-str (:mac-seq ns))
-         :mac-bytes (mac-bytes (:mac-seq ns))
-         :lease-file (:lease-file ns)})
-      (let [tap "jolt0"
-            host-cidr "192.168.44.1/24"
-            config-file (str cache-dir "/dnsmasq.conf")
-            pid-file (str cache-dir "/dnsmasq.pid")
-            lease-file (str cache-dir "/dnsmasq.leases")
-            log-file (str cache-dir "/dnsmasq.log")]
-        (.mkdirs (java.io.File. cache-dir))
-        (net/tap-create! tap)
-        (net/tap-ip! tap host-cidr)
-        (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
-                                               :range-start "192.168.44.10"
-                                               :range-end "192.168.44.100"
-                                               :dns "192.168.44.1"}))
-        (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
-                             :lease-file lease-file :log-file log-file})
-        (reset! net-state {:refs 1 :tap tap :mac-seq 1 :lease-file lease-file})
-        {:tap tap :mac-str (mac-str 1) :mac-bytes (mac-bytes 1) :lease-file lease-file}))))
+    (let [seq (swap! net-seq inc)
+          tap (str "jolt" seq)
+          host-cidr (format "10.44.%d.1/24" seq)
+          config-file (str cache-dir "/dnsmasq-" seq ".conf")
+          pid-file (str cache-dir "/dnsmasq-" seq ".pid")
+          lease-file (str cache-dir "/dnsmasq-" seq ".leases")
+          log-file (str cache-dir "/dnsmasq-" seq ".log")]
+      (.mkdirs (java.io.File. cache-dir))
+      (net/tap-create! tap)
+      (net/tap-ip! tap host-cidr)
+      (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
+                                             :range-start (format "10.44.%d.10" seq)
+                                             :range-end (format "10.44.%d.100" seq)
+                                             :dns host-cidr}))
+      (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
+                           :lease-file lease-file :log-file log-file})
+      {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq)
+       :lease-file lease-file :pid-file pid-file})))
 
-(defn- net-down! [vm]
-  "Detach one VM; the last one tears the shared TAP + dnsmasq down."
-  (locking net-lock
-    (let [s (swap! net-state update :refs dec)]
-      (when (and (zero? (:refs s)) (:tap s))
-        (net/dnsmasq-stop!)
-        (net/tap-delete! (:tap s))
-        (reset! net-state {:refs 0 :tap nil :mac-seq 0 :lease-file nil}))))
+(defn- net-down! [net]
+  "Tear down one VM's TAP + dnsmasq."
+  (net/dnsmasq-stop! (:pid-file net))
+  (net/tap-delete! (:tap net))
   :stopped)
 
 (defn start!
@@ -375,10 +360,10 @@
       (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
             _ (wait-for-tcp! ip 22 30000)]
         (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
-              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net)))
+              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)))
       (catch Exception e
         (.destroyForcibly proc)
-        (net-down! {:tap (:tap net)})
+        (net-down! net)
         (throw e)))))
 
 (defn exec
@@ -554,10 +539,10 @@
       (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)]
         (wait-for-tcp! ip guest-port 30000)
         {:ip ip :rootfs rootfs :process proc :image image :daemon-port guest-port
-         :tap (:tap net) :lease-file (:lease-file net)})
+         :tap (:tap net) :lease-file (:lease-file net) :pid-file (:pid-file net)})
       (catch Exception e
         (.destroyForcibly proc)
-        (net-down! {:tap (:tap net)})
+        (net-down! net)
         (throw e)))))
 
 (defn daemon-exec
@@ -576,7 +561,7 @@
   "Stop a daemon-mode VM (the runner process is the guest's lifetime)."
   [d]
   (when (.isAlive (:process d)) (.destroyForcibly (:process d)))
-  (net-down! {:tap (:tap d)})
+  (net-down! {:tap (:tap d) :pid-file (:pid-file d)})
   :stopped)
 
 (defn attach!

@@ -21,6 +21,6 @@
          :git/sha "6cc6032504762c4b4867278e502421e96bd10cd8"}
         jolt-lang/jolt-tapmasq
         {:git/url "https://github.com/racklr-dev/jolt-tapmasq"
-         :git/sha "c7d4e53b18f1baa5f8170741a7ce9b3628578817"}}
+         :git/sha "a48f41ca01dd17c2ce5a10e7f2dda610efaba45b"}}
 
  :tasks {test "jolt run test/jolt/check_test.clj"}}
