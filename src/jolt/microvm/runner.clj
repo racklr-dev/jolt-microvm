@@ -46,11 +46,13 @@
         ssh-port (int (get cfg "ssh_port" 0))
         cpus (int (get cfg "cpus" 2))
         memory-mib (int (get cfg "memory_mib" 512))
-        rlimits (when-let [n (capped-nofile!)] [n])]
+        rlimits (when-let [n (capped-nofile!)] [n])
+        virtiofs (or (seq (mapv (fn [m] [(get m "tag") (get m "host")]) (get cfg "mounts")))
+                     (when workspace [["workspace" workspace]]))]
     (krun/boot! {:rootfs rootfs
                  :workdir "/"
                  :cpus cpus
                  :memory-mib memory-mib
                  :rlimits rlimits
                  :port-map (when (pos? ssh-port) (str ssh-port ":22"))
-                 :virtiofs ["workspace" workspace]})))
+                 :virtiofs virtiofs})))

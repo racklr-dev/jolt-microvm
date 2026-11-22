@@ -6,12 +6,20 @@
             [clojure.java.shell :as shell])
   (:import [java.nio.file Files Paths LinkOption StandardCopyOption CopyOption]))
 
-(defn image-safe [image] (str/replace image #"[/:]" "_"))
+(defn image-safe
+  "Cache-key-safe form of an image ref + optional arch."
+  [image & [arch]]
+  (str/replace (str image (when arch (str "@" arch))) #"[/:@]" "_"))
+
+(defn image-dir
+  "Cache dir for an image + optional arch under cache-dir."
+  [image cache-dir & [arch]]
+  (str cache-dir "/" (image-safe image arch)))
 
 (defn cached-base-path
-  "Path to the cached base rootfs for an image + cache dir."
-  [image cache-dir]
-  (str cache-dir "/" (image-safe image) "/base"))
+  "Path to the cached base rootfs for an image + cache dir + optional arch."
+  [image cache-dir & [arch]]
+  (str (image-dir image cache-dir arch) "/base"))
 
 (declare copy-tree!)
 
@@ -50,14 +58,14 @@
 
 (defn base!
   "Pull + unpack an OCI image into the cache and return the cached base path.
-  Idempotent: reuses an existing base."
-  [image cache-dir]
-  (let [dir (str cache-dir "/" (image-safe image))
+  Idempotent: reuses an existing base. arch defaults to the host arch."
+  [image cache-dir & [arch]]
+  (let [dir (image-dir image cache-dir arch)
         base (str dir "/base")
         staging (str dir "/.staging")]
     (when-not (.exists (java.io.File. base))
       (.mkdirs (java.io.File. dir))
-      (let [img (oci/pull-image image)]
+      (let [img (oci/pull-image image (if arch {:arch arch} {}))]
         (oci/unpack staging (:layers img))
         (Files/move (Paths/get staging (into-array String []))
                     (Paths/get base (into-array String []))
@@ -66,10 +74,10 @@
 
 (defn prepare!
   "Pull + unpack an OCI image into a fresh session rootfs, caching the base.
-  Returns the session rootfs path."
-  [image cache-dir]
-  (let [dir (str cache-dir "/" (image-safe image))
-        base (base! image cache-dir)
+  Returns the session rootfs path. arch defaults to the host arch."
+  [image cache-dir & [arch]]
+  (let [dir (image-dir image cache-dir arch)
+        base (base! image cache-dir arch)
         session (str dir "/session-" (System/currentTimeMillis))]
     (.mkdirs (java.io.File. session))
     (copy-tree! base session)
@@ -83,6 +91,13 @@
             (when (str/starts-with? (.getName f) "ld-musl-")
               (.getAbsolutePath f)))
           (or (seq (.listFiles d)) []))))
+
+(defn alpine-installed?
+  "True when apk package pkg is recorded in the rootfs's installed database."
+  [rootfs pkg]
+  (let [db (str rootfs "/lib/apk/db/installed")]
+    (and (.exists (java.io.File. db))
+         (str/includes? (slurp db) (str "P:" pkg "\n")))))
 
 (defn install-alpine-packages!
   "Install apk packages into an alpine rootfs using its own apk + musl loader.
@@ -131,12 +146,15 @@
       (spit (str dir "/authorized_keys") (str pubkey "\n")))))
 
 (defn write-krun-config!
-  "Write /.krun_config.json so libkrun's built-in init launches sshd with
-  the workspace virtio-fs mounted (port of mod.rs krun_config)."
-  [rootfs & {:keys [sshd] :or {sshd "/usr/sbin/sshd"}}]
-  (let [cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd "
-                 "&& mkdir -p /workspace && mount -t virtiofs workspace /workspace "
-                 "&& mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
+  "Write /.krun_config.json so libkrun's built-in init launches sshd with each
+  mount tagged and mounted at its guest path. mounts: [{:tag :host :guest}]."
+  [rootfs & {:keys [sshd mounts] :or {sshd "/usr/sbin/sshd" mounts []}}]
+  (let [mkdirs (str/join " && " (map #(str "mkdir -p " (:guest %)) mounts))
+        mount-cmds (str/join " && " (map #(str "mount -t virtiofs " (:tag %) " " (:guest %)) mounts))
+        cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"
+                 (when (seq mkdirs) (str " && " mkdirs))
+                 (when (seq mount-cmds) (str " && " mount-cmds))
+                 " && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
                  "&& exec " sshd " -D -e -o StrictModes=no")
         cfg {"Cmd" ["/bin/sh" "-c" cmd]
              "Env" []

@@ -35,6 +35,7 @@
         kvm-present (probe/kvm-present?)
         kvm-writable (probe/kvm-available?)
         ssh (which "ssh")
+        scp (which "scp")
         keygen (which "ssh-keygen")
         sudo (which "sudo")
         jolt (or (System/getenv "JOLT_BIN")
@@ -57,6 +58,9 @@
          {:name :ssh :status (if ssh :ok :error)
           :message (or ssh "openssh client not found")
           :fix (when-not ssh "install openssh-client")}
+         {:name :scp :status (if scp :ok :warn)
+          :message (or scp "scp not found (copy-to!/copy-from! unavailable)")
+          :fix (when-not scp "install openssh-client")}
          {:name :ssh-keygen :status (if keygen :ok :error)
           :message (or keygen "ssh-keygen not found")
           :fix (when-not keygen "install openssh-client")}
@@ -176,7 +180,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs port private-key-path host-public-key process workspace opts])
+(defrecord VM [image cache-dir rootfs port private-key-path host-public-key process workspace opts mounts])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -202,61 +206,104 @@
             :else
             (do (Thread/sleep 100) (recur))))))))
 
-(defn- ensure-sshd!
-  "Make the cached base for image contain sshd, seeding it with apk if it is an
-  alpine-family image. Idempotent and safe under concurrent start!. Returns the
-  base path."
-  [image cache-dir]
-  (let [base (rootfs/base! image cache-dir)
-        sshd (str base "/usr/sbin/sshd")]
-    (when-not (.exists (java.io.File. sshd))
+(defn- ensure-base!
+  "Make the cached base contain openssh (sshd) and any requested apk packages,
+  seeding with the image's own apk + musl loader when alpine-family. Idempotent
+  and safe under concurrent start!. Returns the base path."
+  [image cache-dir packages arch]
+  (let [base (rootfs/base! image cache-dir arch)
+        wanted (vec (concat ["openssh"] (map str packages)))
+        sshd? (fn [] (.exists (java.io.File. (str base "/usr/sbin/sshd"))))
+        missing (fn [] (remove (fn [pkg]
+                                 (or (rootfs/alpine-installed? base pkg)
+                                     (and (= pkg "openssh") (sshd?))))
+                               wanted))]
+    (when (and (seq (missing)) (not (rootfs/musl-loader base)))
+      (throw (ex-info
+              (str "image has no apk (not alpine-family) and is missing: "
+                   (str/join ", " (missing)) ". Use an alpine image or pre-seed the base.")
+              {:image image :missing (missing)})))
+    (when (seq (missing))
       (with-base-lock!
-        (str cache-dir "/" (rootfs/image-safe image) "/.seed.lock")
+        (str (rootfs/image-dir image cache-dir arch) "/.seed.lock")
         (fn []
-          (when-not (.exists (java.io.File. sshd))
-            (if (rootfs/musl-loader base)
-              (rootfs/install-alpine-packages! base "openssh")
-              (throw (ex-info
-                      (str "image has no sshd and is not alpine-family (no musl loader to seed with). "
-                           "Use an alpine image, or an image with sshd already installed, or pre-seed the base.")
-                      {:image image :base base})))))))
+          (let [still (remove #(rootfs/alpine-installed? base %) (missing))]
+            (when (seq still)
+              (apply rootfs/install-alpine-packages! base still))))))
     base))
 
 ;; -- lifecycle ----------------------------------------------------------------
-(defn start!
-  "Boot a microVM from an OCI image and wait for sshd. Auto-seeds sshd into the
-  cached alpine base on first use. Runs check! first and throws a readable
-  error if any hard dependency is missing.
+(defn- normalize-mounts
+  "Normalize :mounts to [{:tag :host :guest} ...], always including the
+  workspace mount first (tag workspace, guest /workspace)."
+  [workspace mounts]
+  (let [user (cond
+               (nil? mounts) []
+               (map? mounts)
+               (if (and (:host mounts) (:guest mounts))
+                 [mounts]
+                 (mapv (fn [[h g]] {:host h :guest g}) mounts))
+               (sequential? mounts)
+               (mapv (fn [m]
+                       (cond
+                         (map? m) m
+                         (sequential? m) {:host (first m) :guest (second m)}
+                         :else (throw (ex-info "bad mount entry" {:mount m}))))
+                     mounts)
+               :else (throw (ex-info ":mounts must be a map or vector" {:mounts mounts})))
+        tagged (mapv (fn [i m]
+                       (let [h (:host m) g (:guest m)]
+                         (when-not (and h g)
+                           (throw (ex-info "mount needs :host and :guest" {:mount m})))
+                         {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}))
+                     (range) user)]
+    (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
 
-  opts: :image (required), :workspace, :cache-dir, :cpus, :memory-mib,
-        :ssh-port (0 = ephemeral), :project-dir (dir whose deps.edn provides
-        jolt-microvm + its deps). Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib ssh-port project-dir] :as opts}]
+(defn start!
+  "Boot a microVM from an OCI image and wait for sshd. Auto-seeds openssh (and
+  any :packages) into the cached alpine base on first use. Runs check! first.
+
+  opts:
+    :image       required, e.g. \"alpine:3.20\" (multi-arch resolves host arch)
+    :arch        guest arch override (e.g. \"arm64\")
+    :packages    apk packages to pre-install into the cached base [\"python3\"]
+    :workspace   host dir mounted at /workspace (default rootfs/workspace)
+    :mounts      extra volume mounts:
+                   { \"/host/dir\" \"/guest/dir\" }   (host->guest map)
+                   [{:host :guest :tag}]              (vector of specs)
+                   [[\"/h\" \"/g\"] ...]              (vector of pairs)
+    :cache-dir   (default ~/.cache/jolt-microvm)
+    :cpus :memory-mib :ssh-port (0 = ephemeral)
+    :project-dir dir whose deps.edn provides jolt-microvm + deps
+  Returns a VM record."
+  [{:keys [image workspace cache-dir cpus memory-mib ssh-port project-dir
+           packages mounts arch] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
-        _ (ensure-sshd! image cache-dir)
-        rootfs (rootfs/prepare! image cache-dir)
+        _ (ensure-base! image cache-dir packages arch)
+        rootfs (rootfs/prepare! image cache-dir arch)
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
+        mounts (normalize-mounts ws mounts)
         ephemeral (keys/generate-ephemeral!)
         host (keys/generate-host!)]
     (rootfs/inject-sandbox-user! rootfs)
     (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral))
     (keys/inject-host! rootfs host)
-    (rootfs/write-krun-config! rootfs)
+    (rootfs/write-krun-config! rootfs :mounts mounts)
     (let [port (or ssh-port (pick-port))
           cfg {"rootfs_path" rootfs
-               "workspace_path" ws
                "ssh_port" port
                "cpus" (or cpus 2)
-               "memory_mib" (or memory-mib 512)}
+               "memory_mib" (or memory-mib 512)
+               "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m) "guest" (:guest m)}) mounts)}
           proc (spawn-runner! project-dir cfg)]
       (try
         (wait-for-ssh! port 30000)
         (catch Exception e
           (.destroyForcibly proc)
           (throw e)))
-      (->VM image cache-dir rootfs port (:private-key-path ephemeral) (:public-key host) proc ws opts))))
+      (->VM image cache-dir rootfs port (:private-key-path ephemeral) (:public-key host) proc ws opts mounts))))
 
 (defn exec
   "Run a command in the VM. Returns {:stdout :stderr :exit}.
@@ -265,6 +312,74 @@
   (ssh-exec (:port vm) (:private-key-path vm) (:host-public-key vm)
             (str "cd " cwd " && " command)
             :timeout-ms timeout-ms))
+
+(defn exec!
+  "Like exec but throws ex-info when the command exits non-zero (ex-data carries
+  :stdout/:stderr/:exit). Returns the result on success."
+  [vm command & {:keys [cwd timeout-ms] :or {cwd "/workspace" timeout-ms 300000}}]
+  (let [r (exec vm command :cwd cwd :timeout-ms timeout-ms)]
+    (when-not (zero? (:exit r))
+      (throw (ex-info (str "command failed (" (:exit r) "): " command) r)))
+    r))
+
+(defn alive?
+  "True while the VM's runner process is alive."
+  [vm]
+  (boolean (and (:process vm) (.isAlive (:process vm)))))
+
+(defn info
+  "Describe a VM: {:image :port :rootfs :workspace :mounts :running?}."
+  [vm]
+  {:image (:image vm)
+   :port (:port vm)
+   :rootfs (:rootfs vm)
+   :workspace (:workspace vm)
+   :mounts (:mounts vm)
+   :running? (alive? vm)})
+
+(defn- scp
+  "Run scp against the VM with the host key pinned. Returns {:stdout :stderr :exit}."
+  [vm & args]
+  (let [known (known-hosts-path! (:port vm) (:host-public-key vm))]
+    (try
+      (let [argv (into-array String (concat ["scp" "-i" (:private-key-path vm)
+                                             "-P" (str (:port vm))
+                                             "-o" "StrictHostKeyChecking=yes"
+                                             "-o" (str "UserKnownHostsFile=" known)
+                                             "-o" "BatchMode=yes"
+                                             "-o" "LogLevel=ERROR"]
+                                            args))
+            proc (.start (ProcessBuilder. argv))
+            out (future (drain! (.getInputStream proc)))
+            err (future (drain! (.getErrorStream proc)))
+            code (.waitFor proc)]
+        {:stdout @out :stderr @err :exit code})
+      (finally (.delete (java.io.File. known))))))
+
+(defn copy-to!
+  "Copy a host file or dir into the guest (recursive). Returns the scp result."
+  [vm host-path guest-path]
+  (scp vm "-r" host-path (str "sandbox@127.0.0.1:" guest-path)))
+
+(defn copy-from!
+  "Copy a guest file or dir out of the VM (recursive). Returns the scp result."
+  [vm guest-path host-path]
+  (scp vm "-r" (str "sandbox@127.0.0.1:" guest-path) host-path))
+
+(defn install-image!
+  "Install apk packages into the cached base for image; takes effect on the
+  next start!. Returns :installed."
+  [image packages & {:keys [cache-dir arch] :or {cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm") arch nil}}]
+  (ensure-base! image cache-dir (vec packages) arch)
+  :installed)
+
+(defn install!
+  "Install apk packages into the VM's cached base image; takes effect on the
+  next start! (the running VM is a clone and won't see them until reboot!)."
+  [vm & packages]
+  (install-image! (:image vm) (vec packages)
+                  :cache-dir (:cache-dir vm)
+                  :arch (get-in vm [:opts :arch])))
 
 (defn attach!
   "Attach an interactive SSH session to the running VM over an isolated pty
@@ -306,6 +421,14 @@
     (.destroyForcibly (:process vm)))
   :stopped)
 
+(defmacro with-vm
+  "Boot a VM from opts, bind it to sym, run body, and stop! it in a finally."
+  [[sym opts] & body]
+  `(let [~sym (start! ~opts)]
+     (try
+       ~@body
+       (finally (stop! ~sym)))))
+
 ;; -- snapshots ---------------------------------------------------------------
 (defn snapshots-dir [vm] (str (:cache-dir vm) "/snapshots"))
 
@@ -341,7 +464,7 @@
   (when (and (:process vm) (.isAlive (:process vm)))
     (throw (ex-info "VM is running — stop it before restoring a snapshot" {})))
   (let [snap (str (snapshots-dir vm) "/" name)
-        base (rootfs/cached-base-path (:image vm) (:cache-dir vm))]
+        base (rootfs/cached-base-path (:image vm) (:cache-dir vm) (get-in vm [:opts :arch]))]
     (when-not (.isDirectory (java.io.File. snap))
       (throw (ex-info "snapshot does not exist" {:name name})))
     (rootfs/cleanup! base)
