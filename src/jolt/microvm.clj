@@ -9,6 +9,7 @@
   (:require [jolt.microvm.keys :as keys]
             [jolt.microvm.rootfs :as rootfs]
             [jolt.libkrun.probe :as probe]
+            [jolt.pty :as pty]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.data.json :as json])
@@ -121,12 +122,19 @@
           (recur))))
     (String. (.toByteArray baos) "UTF-8")))
 
+(defn- known-hosts-path!
+  "Write a one-off known_hosts pinning the guest host key to 127.0.0.1:port.
+  Returns the file path; caller deletes it when done."
+  [port host-public-key]
+  (let [known (str (System/getProperty "java.io.tmpdir") "/jolt-known-" (java.util.UUID/randomUUID))]
+    (spit known (str "[127.0.0.1]:" port " " host-public-key "\n"))
+    known))
+
 (defn ssh-exec
   "Run command in the guest over SSH, verifying the injected host key.
   Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000)."
   [port private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
-  (let [known (str (System/getProperty "java.io.tmpdir") "/jolt-known-" (java.util.UUID/randomUUID))]
-    (spit known (str "[127.0.0.1]:" port " " host-public-key "\n"))
+  (let [known (known-hosts-path! port host-public-key)]
     (try
       (let [argv (into-array String ["ssh" "-i" private-key-path
                                      "-p" (str port)
@@ -257,6 +265,32 @@
   (ssh-exec (:port vm) (:private-key-path vm) (:host-public-key vm)
             (str "cd " cwd " && " command)
             :timeout-ms timeout-ms))
+
+(defn attach!
+  "Attach an interactive SSH session to the running VM over an isolated pty
+  (console relay). Blocks until the session exits; returns its exit status.
+  The guest host key is pinned, and the host terminal size is applied to the
+  pty."
+  [vm]
+  (let [known (known-hosts-path! (:port vm) (:host-public-key vm))
+        p (pty/open-pty!)]
+    (try
+      ;; Raw secondary: no local echo/canonical, so ssh requests ECHO=0 remotely
+      ;; and the host terminal's own echo is the single echo.
+      (pty/make-raw! (:secondary-fd p))
+      (let [child (pty/spawn-secondary!
+                   p ["ssh" "-i" (:private-key-path vm)
+                      "-p" (str (:port vm))
+                      "-o" "StrictHostKeyChecking=yes"
+                      "-o" (str "UserKnownHostsFile=" known)
+                      "-o" "BatchMode=yes"
+                      "-o" "LogLevel=ERROR"
+                      "-t"
+                      "sandbox@127.0.0.1"])]
+        (pty/relay! p child))
+      (finally
+        (pty/close-pty! p)
+        (.delete (java.io.File. known))))))
 
 (defn stop!
   "Shut down the VM: graceful SSH poweroff, then destroy the runner process."
