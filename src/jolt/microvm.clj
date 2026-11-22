@@ -134,20 +134,31 @@
     (spit known (str "[127.0.0.1]:" port " " host-public-key "\n"))
     known))
 
+(defn- ssh-control-path [port]
+  (str (System/getProperty "java.io.tmpdir") "/jolt-ssh-ctl-" port))
+
+(defn- ssh-mux-args [port]
+  ["-o" "ControlMaster=auto"
+   "-o" (str "ControlPath=" (ssh-control-path port))
+   "-o" "ControlPersist=120"])
+
 (defn ssh-exec
   "Run command in the guest over SSH, verifying the injected host key.
-  Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000)."
+  Reuses a persistent SSH connection (ControlMaster) keyed by port so repeated
+  execs skip the handshake. Returns {:stdout :stderr :exit}.
+  opts: :timeout-ms (default 300000)."
   [port private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
   (let [known (known-hosts-path! port host-public-key)]
     (try
-      (let [argv (into-array String ["ssh" "-i" private-key-path
-                                     "-p" (str port)
-                                     "-o" "StrictHostKeyChecking=yes"
-                                     "-o" (str "UserKnownHostsFile=" known)
-                                     "-o" "BatchMode=yes"
-                                     "-o" "ConnectTimeout=10"
-                                     "-o" "LogLevel=ERROR"
-                                     "sandbox@127.0.0.1" command])
+      (let [argv (into-array String (concat ["ssh" "-i" private-key-path
+                                             "-p" (str port)
+                                             "-o" "StrictHostKeyChecking=yes"
+                                             "-o" (str "UserKnownHostsFile=" known)
+                                             "-o" "BatchMode=yes"
+                                             "-o" "ConnectTimeout=10"
+                                             "-o" "LogLevel=ERROR"]
+                                            (ssh-mux-args port)
+                                            ["sandbox@127.0.0.1" command]))
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
             err (future (drain! (.getErrorStream proc)))]
@@ -348,6 +359,7 @@
                                              "-o" (str "UserKnownHostsFile=" known)
                                              "-o" "BatchMode=yes"
                                              "-o" "LogLevel=ERROR"]
+                                            (ssh-mux-args (:port vm))
                                             args))
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
@@ -464,6 +476,12 @@
   (Thread/sleep 200)
   (when (.isAlive (:process vm))
     (.destroyForcibly (:process vm)))
+  ;; tear down the persistent SSH control socket for this port (best-effort)
+  (try
+    (shell/sh "ssh" "-O" "exit"
+              "-o" (str "ControlPath=" (ssh-control-path (:port vm)))
+              "sandbox@127.0.0.1")
+    (catch Exception _ nil))
   :stopped)
 
 (defmacro with-vm

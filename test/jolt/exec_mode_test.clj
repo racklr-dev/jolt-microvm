@@ -15,7 +15,7 @@
   (assert (str/includes? (:stdout r) "exec-ok") (str "stdout: " (:stdout r))))
 
 ;; distroless direct-exec: python3 boots with no shell/sshd at all
-(let [r (vm/run-image! {:image "gcr.io/distroless/python3-debian12:latest"
+(let [r (vm/run-image! {:image "gcr.io/distroless/python3-debian13:latest"
                         :cmd ["/usr/bin/python3" "-c" "print('distroless-ok')"]
                         :cache-dir "/tmp/jolt-exec-cache"
                         :cpus 1 :memory-mib 256
@@ -24,7 +24,7 @@
   (assert (str/includes? (:stdout r) "distroless-ok") (str "stdout: " (:stdout r))))
 
 ;; distroless nonzero exit code
-(let [r (vm/run-image! {:image "gcr.io/distroless/python3-debian12:latest"
+(let [r (vm/run-image! {:image "gcr.io/distroless/python3-debian13:latest"
                         :cmd ["/usr/bin/python3" "-c" "import sys; sys.exit(3)"]
                         :cache-dir "/tmp/jolt-exec-cache"
                         :cpus 1 :memory-mib 256
