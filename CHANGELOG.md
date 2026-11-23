@@ -1,0 +1,44 @@
+# Changelog
+
+jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
+release markers. New work lands on `main` and is released by tagging.
+
+## v1.1.0 — 2026-11-23
+
+### Added
+
+- `start!` opt `:writable-home?` (default `false`). When true, the warm VM's
+  sandbox home (`/home/sandbox`) is left writable to its owner, so virtiofs
+  mounts can be created **under** the home directory — the faraday case of
+  mounting the host `~/.faraday` at the guest `~/.faraday` so config/auth inside
+  the exec resolves naturally.
+- `test/jolt/writable_home_test.clj`: integration coverage for both modes —
+  mount-under-home boots and reads a file when the opt is on; `touch` in the
+  home fails when it is off.
+
+### Changed
+
+- `inject-authorized-keys!` now takes a `:writable-home?` kwarg instead of
+  always clearing the home's owner-write bit. Default behavior is unchanged
+  (home read-only to the sandbox user), so existing callers are unaffected.
+
+## v1.0.0 — 2026-11-21
+
+- 2.0 libkrun builder/device API, per-VM TAP+dnsmasq networking, warm SSH
+  sessions, snapshot/restore, and the direct-exec `run-image!` path.
+
+## v0.5.0 — 2026-11-21
+
+- Per-VM TAP+dnsmasq so concurrent boots multiplex cleanly.
+
+## v0.4.0 — 2026-11-21
+
+- Refcounted shared TAP+dnsmasq; egress e2e (DHCP + DNS + allow-listed NAT).
+
+## v0.3.0 — 2026-11-21
+
+- Volume mounts (virtio-fs) and the workspace mount.
+
+## v0.2.0 — 2026-11-21
+
+- First tagged release: libkrun boot + SSH exec.

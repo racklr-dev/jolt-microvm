@@ -81,6 +81,10 @@ Manage the lifecycle by hand:
 a pre-flight check, and throws a readable error if something is missing.
 `:mounts` accepts a host→guest map, a vector of `{:host :guest :tag}` specs, or
 a vector of `[host guest]` pairs; each mount is a separate virtio-fs device.
+`:writable-home?` (default false) leaves the sandbox home writable so mounts can
+be created under `/home/sandbox` — e.g. mount the host `~/.faraday` there and
+faraday inside the exec reads the same settings. When off, the home stays
+non-writable to the sandbox user (sshd hygiene).
 `:arch` overrides the host-architecture default (x86_64→amd64, aarch64→arm64).
 
 Direct-exec for distroless / shell-less images (no SSH, no shell):

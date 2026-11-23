@@ -135,13 +135,18 @@
       (spit gp (str group "sandbox:x:1000:\n")))))
 
 (defn inject-authorized-keys!
-  "Write the client public key into the sandbox user's authorized_keys."
-  [rootfs pubkey]
+  "Write the client public key into the sandbox user's authorized_keys.
+  By default the sandbox home is made non-writable to its owner (sshd
+  StrictModes hygiene). Pass :writable-home? true to leave it writable, so the
+  warm VM can create and mount directories under /home/sandbox (e.g.
+  ~/.faraday)."
+  [rootfs pubkey & {:keys [writable-home?] :or {writable-home? false}}]
   (let [dir (str rootfs "/home/sandbox/.ssh")]
     (.mkdirs (java.io.File. dir))
     (let [home (java.io.File. (str rootfs "/home/sandbox"))
           sshd (java.io.File. dir)]
-      (.setWritable home false true)
+      (when-not writable-home?
+        (.setWritable home false true))
       (.setWritable sshd true true)
       (spit (str dir "/authorized_keys") (str pubkey "\n")))))
 

@@ -329,11 +329,13 @@
                    { \"/host/dir\" \"/guest/dir\" }   (host->guest map)
                    [{:host :guest :tag}]              (vector of specs)
                    [[\"/h\" \"/g\"] ...]              (vector of pairs)
+    :writable-home? (default false) leave the sandbox home writable so mounts
+                   can be created under /home/sandbox (e.g. ~/.faraday)
     :cache-dir   (default ~/.cache/jolt-microvm)
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home?] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -345,7 +347,7 @@
         ephemeral (keys/generate-ephemeral!)
         host (keys/generate-host!)
         _ (rootfs/inject-sandbox-user! rootfs)
-        _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral))
+        _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? writable-home?)
         _ (keys/inject-host! rootfs host)
         net (net-up! cache-dir)
         exec-cmd (rootfs/sshd-exec-command mounts)
