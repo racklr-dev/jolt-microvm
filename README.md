@@ -1,26 +1,49 @@
-# jolt-microvm
-
-[![tests](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml/badge.svg)](https://github.com/racklr-dev/jolt-microvm/actions/workflows/ci.yml)
+# jolt-microvm — OCI-image-backed libkrun microVMs over SSH
 
 Run commands inside an OCI-image-backed [libkrun](https://github.com/containers/libkrun)
-microVM over SSH: a port of dirge's `sandbox/microvm` to
-[jolt](https://github.com/jolt-lang/jolt). Boot any alpine-based image (any
-language runtime, via `:packages`), mount host directories, run commands or a
-long-lived agent session over SSH, and snapshot the rootfs.
+microVM over SSH, from [jolt](https://github.com/jolt-lang/jolt). Boot any
+alpine-based image (any language runtime, via `:packages`), mount host
+directories, run commands or a long-lived agent session over SSH, and snapshot
+the rootfs. A direct-exec mode boots distroless and shell-less images with no
+SSH.
 
-## Plug-and-play
+## Requirements
+
+- libkrun + libkrunfw (`libkrun.so` / `libkrun.dylib`)
+- Linux: a writable `/dev/kvm` (user in the `kvm` group) — keep your normal
+  primary gid: `sg kvm` breaks virtio-fs guest writes
+- `ssh`, `ssh-keygen` (and `scp` for the copy helpers) on the host
+- `sudo` only for the automatic alpine seed
+- [jolt](https://github.com/jolt-lang/jolt) 0.8.28+ (the runner is a jolt
+  subprocess)
+
+## Build
+
+Nothing to compile. Run the suite:
+
+```sh
+jolt run test/jolt/check_test.clj    # pre-flight + smoke
+jolt run test/jolt/snapshot_test.clj
+jolt run test/jolt/exec_mode_test.clj
+jolt run test/jolt/egress_test.clj
+jolt run test/jolt/attach_test.clj
+```
+
+The boot tests need the requirements above; `check!` reports each one with a
+fix hint.
+
+## Usage
 
 ```clojure
 {:deps {racklr-dev/jolt-microvm
         {:git/url "https://github.com/racklr-dev/jolt-microvm"
-         :git/sha "<latest sha>"}}}
+         :git/sha "<pinned sha>"}}}
 ```
 
 ```clojure
 (require '[jolt.microvm :as vm])
 
-;; start! auto-seeds openssh + any :packages into the cached alpine base,
-;; runs a pre-flight check, and throws a readable error if something is missing.
+;; with-vm boots, runs the body, and stop!s in a finally
 (vm/with-vm [v {:image "alpine:3.20"
                 :packages ["python3"]
                 :mounts {"/host/data" "/data"}
@@ -28,153 +51,39 @@ long-lived agent session over SSH, and snapshot the rootfs.
                 :cache-dir "/tmp/cache"
                 :project-dir "/path/to/your/project"}]
   (vm/exec v "python3 -c 'print(42)'")     ; => {:stdout "42\n" :stderr "" :exit 0}
-  (vm/exec v "echo hi > /workspace/x.txt") ; workspace mount, host-readable
-  (vm/exec v "echo data > /data/y.txt")    ; extra mount
+  (vm/exec v "echo hi > /workspace/x.txt")
   (slurp "/tmp/ws/x.txt"))                 ; => "hi\n"
 ```
 
-`with-vm` boots, runs the body, and `stop!`s in a `finally`. Or manage the
-lifecycle by hand:
+Manage the lifecycle by hand:
 
 ```clojure
 (def v (vm/start! {:image "alpine:3.20"
                    :cache-dir "/tmp/cache"
                    :project-dir "/path/to/your/project"}))
 
-(vm/exec v "uname -a")          ; {:stdout :stderr :exit}
+(vm/exec v "uname -a")          ; => {:stdout ... :stderr ... :exit ...}
 (vm/exec! v "true")             ; like exec, throws on nonzero exit
-(vm/exec v "sleep 60" :timeout-ms 3000)  ; throws on wall-clock timeout
-
+(vm/exec v "sleep 60" :timeout-ms 3000)   ; throws on wall-clock timeout
 (vm/copy-to! v "/host/file" "/workspace/file")   ; host -> guest (scp)
 (vm/copy-from! v "/workspace/file" "/host/file") ; guest -> host (scp)
-
-(vm/alive? v)  ; => true
-(vm/info v)    ; {:image :port :rootfs :workspace :mounts :running?}
+(vm/alive? v)                   ; => true
+(vm/info v)                     ; {:image :port :rootfs :workspace :mounts :running?}
 
 (vm/save-snapshot! v "pre-upgrade")
-(vm/reboot! v)                   ; stop + fresh start; in-VM changes discarded
+(vm/reboot! v)                  ; stop + fresh start; in-VM changes discarded
 (vm/stop! v)
 (vm/restore-snapshot! v "pre-upgrade")
 (vm/delete-snapshot! v "pre-upgrade")
 ```
 
-### Long-running agent sessions
+`start!` auto-seeds openssh + any `:packages` into the cached alpine base, runs
+a pre-flight check, and throws a readable error if something is missing.
+`:mounts` accepts a host→guest map, a vector of `{:host :guest :tag}` specs, or
+a vector of `[host guest]` pairs; each mount is a separate virtio-fs device.
+`:arch` overrides the host-architecture default (x86_64→amd64, aarch64→arm64).
 
-A VM stays booted until `stop!`, so an agent can keep one warm and `exec` many
-commands into the same rootfs:
-
-```clojure
-(vm/with-vm [v {:image "alpine:3.20"
-                :packages ["python3" "nodejs"]
-                :mounts {"/srv/repo" "/repo"}
-                :project-dir "/path/to/your/project"}]
-  (vm/exec! v "cd /repo && python3 -m pytest")   ; run your test suite sandboxed
-  (vm/exec v "node -e 'console.log(1+1)'"))
-```
-
-### Interactive shell
-
-```clojure
-(vm/attach! v)   ; SSH session over an isolated pty; host terminal size applied
-```
-
-## CLI
-
-```bash
-jolt run -m jolt.microvm.cli check
-jolt run -m jolt.microvm.cli exec alpine:3.20 uname -a
-jolt run -m jolt.microvm.cli run  alpine:3.20 python3 -c 'print(42)'
-jolt run -m jolt.microvm.cli shell alpine:3.20
-jolt run -m jolt.microvm.cli install alpine:3.20 python3 nodejs
-jolt run -m jolt.microvm.cli snapshots alpine:3.20
-```
-
-`exec` streams output and exits with the guest command's status; `run` throws
-on nonzero; `shell` attaches interactively. The CLI uses the project dir it is
-launched from for dependency resolution (`user.dir`).
-
-## Volume mounts
-
-`:workspace` is the host dir mounted at `/workspace` (default
-`rootfs/workspace`). `:mounts` adds more, in any of three forms:
-
-```clojure
-{:mounts {"/host/a" "/a" "/host/b" "/b"}}   ; host->guest map
-{:mounts [{:host "/host/a" :guest "/a" :tag "a"}]}  ; specs (tag optional)
-{:mounts [["/host/a" "/a"] ["/host/b" "/b"]]}      ; pairs
-```
-
-Each mount is a separate virtio-fs device; the guest sees them at their guest
-paths. Writes are visible on the host immediately.
-
-## Multi-arch
-
-`start!` resolves the OCI image for the host architecture by default
-(x86_64 -> amd64, aarch64 -> arm64). Override with `:arch`:
-
-```clojure
-(vm/start! {:image "alpine:3.20" :arch "arm64" ...})
-```
-
-The per-arch cache is isolated, and `jolt-oci` supports digest refs
-(`alpine@sha256:...`) too.
-
-## Installing packages into the base
-
-`:packages` seeds the cached base before boot (alpine `apk`, no docker needed).
-To add packages without booting, or for the next start:
-
-```clojure
-(vm/install! v "python3")             ; VM-aware
-(vm/install-image! "alpine:3.20" ["nodejs"] :cache-dir "/tmp/cache")
-```
-
-## Pre-flight check
-
-```clojure
-(vm/check!)
-;; {:ok? true :results [{:name :libkrun :status :ok :message "/usr/local/lib/libkrun.so" :fix nil} ...]}
-```
-
-`start!` runs `check!` and throws on `:error` results with a fix hint in the
-message. `:scp` and `:sudo` are warnings (copy helpers / auto-seed unavailable).
-
-## Requirements
-
-- libkrun + libkrunfw (`libkrun.so` / `libkrun.dylib`).
-- Linux: `/dev/kvm` writable (user in the `kvm` group). **Keep your normal
-  primary gid**: `sg kvm` breaks virtio-fs guest writes; use a login shell or
-  `setpriv --regid $(id -g) --groups kvm,...`.
-- `ssh`, `ssh-keygen` (and `scp` for copy helpers) on the host.
-- `sudo` only for the automatic alpine seed.
-- The jolt binary at `~/.local/bin/jolt` (or set `JOLT_BIN`): the runner is a
-  jolt subprocess.
-
-## Modules
-
-- `jolt.microvm`: `check!`, `start!`/`exec`/`exec!`/`attach!`/`stop!`,
-  `with-vm`, `alive?`, `info`, `copy-to!`/`copy-from!`,
-  `install!`/`install-image!`, `save-snapshot!`/`list-snapshots`/
-  `restore-snapshot!`/`delete-snapshot!`/`reboot!`, macOS helpers.
-- `jolt.microvm.cli`: the `jolt run -m` command-line interface.
-- `jolt.microvm.rootfs`: `base!`, `prepare!`, `musl-loader`,
-  `alpine-installed?`, `install-alpine-packages!`, `cp-r!`, `cleanup!`,
-  user/key/krun-config injection, multi-mount config.
-- `jolt.microvm.keys`: ephemeral + host ed25519 keys via `ssh-keygen`.
-- `jolt.microvm.runner`: subprocess `-main` that caps `RLIMIT_NOFILE` and
-  blocks in `boot!` with all virtio-fs mounts.
-
-Siblings: [jolt-pty](https://github.com/racklr-dev/jolt-pty) (pty primitives +
-console relay), [jolt-libkrun](https://github.com/racklr-dev/jolt-libkrun)
-(krun_* bindings + lib probe), [jolt-oci](https://github.com/racklr-dev/jolt-oci)
-(multi-arch OCI pull + unpack).
-
-## Direct-exec (distroless and shell-less images)
-
-`start!` is the SSH *session* mode: it seeds openssh, so it needs an alpine
-(apk) base or an image that already ships sshd. For distroless and other
-images with no shell/sshd, use `run-image!`, which boots the image straight
-into a command via `krun_set_exec` (no SSH) and returns the output:
+Direct-exec for distroless / shell-less images (no SSH, no shell):
 
 ```clojure
 (vm/run-image! {:image "gcr.io/distroless/python3-debian13:latest"
@@ -184,11 +93,59 @@ into a command via `krun_set_exec` (no SSH) and returns the output:
 ;; => {:stdout "hi\n" :stderr "" :exit 0}
 ```
 
-`run-image!` is one-shot and blocking (with `:timeout-ms`); the guest's exit
-code is the returned `:exit`. It works for any image whose rootfs contains the
-executable: alpine with `/bin/sh`, distroless language images, or your own
-layered binary.
+## API
+
+| Function | Args | Returns | Errors |
+|---|---|---|---|
+| `check!` | — | `{:ok? true :results [...]}` | — |
+| `start!` | `opts` | VM handle | throws if `check!` finds an `:error` |
+| `exec` | `vm command & opts` | `{:stdout :stderr :exit}` | throws on timeout |
+| `exec!` | `vm command & opts` | `{:stdout :stderr :exit}` | throws on nonzero exit or timeout |
+| `alive?` | `vm` | boolean | — |
+| `info` | `vm` | `{:image :port :rootfs :workspace :mounts :running?}` | — |
+| `copy-to!` | `vm host-path guest-path` | nil | throws on scp failure |
+| `copy-from!` | `vm guest-path host-path` | nil | throws on scp failure |
+| `install-image!` | `image packages & opts` | `:ok` | — |
+| `install!` | `vm packages` | `:ok` | — |
+| `run-image!` | `opts` | `{:stdout :stderr :exit}` | throws on timeout |
+| `start-daemon!` / `daemon-exec` / `daemon-run` / `stop-daemon!` | see `jolt-exec` | exec daemon (no SSH) | — |
+| `attach!` | `vm` | exit status (blocks) | — |
+| `save-snapshot!` | `vm name` | snapshot ref | — |
+| `list-snapshots` | `vm` | vector of names | — |
+| `restore-snapshot!` | `vm name` | nil | — |
+| `delete-snapshot!` | `vm name` | nil | — |
+| `reboot!` | `vm` | nil | — |
+| `stop!` | `vm` | nil | — |
+| `with-vm` (macro) | `[sym opts] & body` | body's value | — |
+
+A VM stays booted until `stop!`, so an agent keeps one warm and `exec`s many
+commands into the same rootfs. The CLI (`jolt run -m jolt.microvm.cli ...`)
+exposes `check`, `exec`, `run`, `shell`, `install`, and `snapshots`; `exec`
+streams output and exits with the guest's status, `run` throws on nonzero,
+`shell` attaches interactively.
+
+## Modules
+
+- `jolt.microvm` — the API above.
+- `jolt.microvm.cli` — the `jolt run -m` command-line interface.
+- `jolt.microvm.rootfs` — base/prepare, alpine package install, mount + user/key/krun-config injection.
+- `jolt.microvm.keys` — ephemeral + host ed25519 keys via `ssh-keygen`.
+- `jolt.microvm.runner` — the subprocess that boots libkrun with all virtio-fs mounts.
+
+## Status
+
+beta — boot, exec/exec!, warm reuse, snapshots/restore, direct-exec
+(distroless), daemon mode, egress, and attach are each exercised by the test
+suite. Multi-arch is resolved but arm64 boot is only smoke-tested on x86_64
+hosts.
 
 ## License
 
 EPL-2.0
+
+## Learn more
+
+- [jolt-lang](https://github.com/jolt-lang/jolt) — the language and toolchain
+- [libkrun](https://github.com/containers/libkrun) — the microVM runtime
+- [jolt-libkrun](https://github.com/racklr-dev/jolt-libkrun) — the krun_* bindings this drives
+- [jolt-oci](https://github.com/racklr-dev/jolt-oci) — the image pull + unpack layer
