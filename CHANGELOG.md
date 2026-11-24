@@ -3,6 +3,17 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.2.1 — 2026-11-23
+
+### Fixed
+
+- A mount whose guest path would clobber a boot-critical path (an ancestor of
+  or equal to /home/sandbox/.ssh, /workspace, /run, /var/empty — e.g. mounting
+  /home/sandbox itself) now throws a clear \"protected sandbox path\" error
+  instead of booting a VM whose sshd auth is gone, which surfaced as every
+  exec failing with ssh exit 255.
+- `test/jolt/protected_mount_test.clj` covers the guard.
+
 ## v1.2.0 — 2026-11-23
 
 ### Added

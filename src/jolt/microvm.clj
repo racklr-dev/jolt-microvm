@@ -262,6 +262,25 @@
       (contains? #{"rw" :rw} v) false
       :else (throw (ex-info "mount mode must be :ro or :rw" {:mount m :mode v})))))
 
+(def ^:private protected-guest-paths
+  "Guest paths the warm VM's boot/exec depends on; a mount must not equal or
+  ancestor them (mounting /home/sandbox would hide .ssh/authorized_keys and
+  make every ssh exec fail)."
+  ["/workspace" "/home/sandbox/.ssh" "/run" "/var/empty"])
+
+(defn- path-ancestor?
+  "True when prefix is an ancestor path of p (or equal)."
+  [prefix p]
+  (or (= (str prefix) (str p))
+      (let [prefix (if (str/ends-with? prefix "/") prefix (str prefix "/"))]
+        (str/starts-with? p prefix))))
+
+(defn- protected-mount?
+  "True when mounting at guest path g would cover a protected path."
+  [g]
+  (let [g (str g)]
+    (boolean (some #(path-ancestor? g %) protected-guest-paths))))
+
 (defn- normalize-mounts
   "Normalize :mounts to [{:tag :host :guest :readonly?} ...], always including
   the workspace mount first (tag workspace, guest /workspace, read-write)."
@@ -287,6 +306,11 @@
                        (let [h (:host m) g (:guest m) ro (mount-readonly? m)]
                          (when-not (and h g)
                            (throw (ex-info "mount needs :host and :guest" {:mount m})))
+                         (when (protected-mount? g)
+                           (throw (ex-info (str "mount guest path " (pr-str g)
+                                                " would clobber a protected sandbox path"
+                                                " (sshd home/.ssh, /workspace, /run, /var/empty)")
+                                            {:mount m})))
                          (cond-> {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}
                            ro (assoc :readonly? true))))
                      (range) user)]
