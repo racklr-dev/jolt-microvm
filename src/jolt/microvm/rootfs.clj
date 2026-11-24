@@ -156,6 +156,7 @@
   [mounts & {:keys [sshd] :or {sshd "/usr/sbin/sshd"}}]
   (let [mount-cmds (str/join " && "
                              (map #(str "mkdir -p " (:guest %) " && mount -t virtiofs "
+                                        (when (:readonly? %) "-o ro ")
                                         (:tag %) " " (:guest %))
                                   mounts))
         cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"

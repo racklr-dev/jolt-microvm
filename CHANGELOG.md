@@ -3,6 +3,17 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.2.0 — 2026-11-23
+
+### Added
+
+- Read-only volume mounts. A mount entry may carry `:readonly?` / `:ro`
+  (boolean) or `:mode` `"ro"`/`"rw"` (default `rw`); a read-only mount is
+  mounted `-o ro` in the guest, so the sandbox can read host config but not
+  write it. Also accepts `[host guest "ro"]` pairs.
+- `test/jolt/readonly_mount_test.clj`: ro mount rejects writes, default mount
+  accepts them.
+
 ## v1.1.0 — 2026-11-23
 
 ### Added

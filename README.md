@@ -81,6 +81,9 @@ Manage the lifecycle by hand:
 a pre-flight check, and throws a readable error if something is missing.
 `:mounts` accepts a host→guest map, a vector of `{:host :guest :tag}` specs, or
 a vector of `[host guest]` pairs; each mount is a separate virtio-fs device.
+A mount may carry `:readonly?` / `:ro` (boolean) or `:mode` `"ro"`/`"rw"`
+(default `rw`) — a read-only mount is mounted `-o ro` in the guest, so the
+sandbox can read config but not write it.
 `:writable-home?` (default false) leaves the sandbox home writable so mounts can
 be created under `/home/sandbox` — e.g. mount the host `~/.faraday` there and
 faraday inside the exec reads the same settings. When off, the home stays

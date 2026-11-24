@@ -249,9 +249,22 @@
     base))
 
 ;; -- lifecycle ----------------------------------------------------------------
+(defn- mount-readonly?
+  "Coerce a mount entry's mode to a boolean read-only flag. The entry may carry
+  :readonly? (boolean), :ro (boolean), or :mode (\"ro\"/\"rw\" or :ro/:rw);
+  default false (read-write)."
+  [m]
+  (let [v (or (:readonly? m) (:ro m) (:mode m))]
+    (cond
+      (nil? v) false
+      (boolean? v) v
+      (contains? #{"ro" :ro} v) true
+      (contains? #{"rw" :rw} v) false
+      :else (throw (ex-info "mount mode must be :ro or :rw" {:mount m :mode v})))))
+
 (defn- normalize-mounts
-  "Normalize :mounts to [{:tag :host :guest} ...], always including the
-  workspace mount first (tag workspace, guest /workspace)."
+  "Normalize :mounts to [{:tag :host :guest :readonly?} ...], always including
+  the workspace mount first (tag workspace, guest /workspace, read-write)."
   [workspace mounts]
   (let [user (cond
                (nil? mounts) []
@@ -263,15 +276,19 @@
                (mapv (fn [m]
                        (cond
                          (map? m) m
-                         (sequential? m) {:host (first m) :guest (second m)}
+                         (sequential? m)
+                         (let [[h g mode] m]
+                           (cond-> {:host h :guest g}
+                             mode (assoc :mode mode)))
                          :else (throw (ex-info "bad mount entry" {:mount m}))))
                      mounts)
                :else (throw (ex-info ":mounts must be a map or vector" {:mounts mounts})))
         tagged (mapv (fn [i m]
-                       (let [h (:host m) g (:guest m)]
+                       (let [h (:host m) g (:guest m) ro (mount-readonly? m)]
                          (when-not (and h g)
                            (throw (ex-info "mount needs :host and :guest" {:mount m})))
-                         {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}))
+                         (cond-> {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}
+                           ro (assoc :readonly? true))))
                      (range) user)]
     (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
 
@@ -331,6 +348,8 @@
                    [[\"/h\" \"/g\"] ...]              (vector of pairs)
     :writable-home? (default false) leave the sandbox home writable so mounts
                    can be created under /home/sandbox (e.g. ~/.faraday)
+    A mount entry may also carry :readonly? / :ro (boolean) or :mode
+    \"ro\"/\"rw\" (default rw); a readonly mount is mounted -o ro in the guest.
     :cache-dir   (default ~/.cache/jolt-microvm)
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
