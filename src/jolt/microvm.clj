@@ -149,8 +149,12 @@
 (defn ssh-exec
   "Run command in the guest over SSH, verifying the injected host key. host is
   the guest's IP. Reuses a persistent SSH connection (ControlMaster) keyed by
-  host. Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000)."
-  [host private-key-path host-public-key command & {:keys [timeout-ms] :or {timeout-ms 300000}}]
+  host. Returns {:stdout :stderr :exit}. opts: :timeout-ms (default 300000),
+  :interrupt (an atom polled while the command runs; when truthy the ssh
+  process is killed and the result carries :interrupted? true),
+  :interrupt-poll-ms (default 50)."
+  [host private-key-path host-public-key command & {:keys [timeout-ms interrupt interrupt-poll-ms]
+                                                    :or {timeout-ms 300000 interrupt-poll-ms 50}}]
   (let [known (known-hosts-path! host host-public-key)]
     (try
       (let [argv (into-array String (concat ["ssh" "-i" private-key-path
@@ -164,12 +168,22 @@
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
             err (future (drain! (.getErrorStream proc)))]
-        (if (.waitFor proc timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-          {:stdout @out :stderr @err :exit (.exitValue proc)}
-          (do (.destroyForcibly proc)
-              (future-cancel out)
-              (future-cancel err)
-              (throw (ex-info "ssh command timed out" {:command command :timeout-ms timeout-ms})))))
+        (loop [deadline (+ (System/currentTimeMillis) timeout-ms)]
+          (if (.waitFor proc interrupt-poll-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+            {:stdout @out :stderr @err :exit (.exitValue proc)}
+            (cond
+              (and interrupt @interrupt)
+              (do (.destroyForcibly proc)
+                  {:stdout (deref out 1000 "") :stderr (deref err 1000 "")
+                   :exit nil :interrupted? true})
+
+              (> (System/currentTimeMillis) deadline)
+              (do (.destroyForcibly proc)
+                  (future-cancel out)
+                  (future-cancel err)
+                  (throw (ex-info "ssh command timed out" {:command command :timeout-ms timeout-ms})))
+
+              :else (recur deadline)))))
       (finally (.delete (java.io.File. known))))))
 
 ;; -- runner ------------------------------------------------------------------
@@ -446,20 +460,22 @@
       (str "cd " cwd " && " command))))
 
 (defn exec
-  "Run a command in the VM. Returns {:stdout :stderr :exit}.
-  opts: :cwd (default the workspace's guest path), :timeout-ms (default 300000)."
-  [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
+  "Run a command in the VM. Returns {:stdout :stderr :exit}, plus
+  :interrupted? true when an :interrupt atom fired.
+  opts: :cwd (default the workspace's guest path), :timeout-ms (default 300000),
+  :interrupt (atom), :interrupt-poll-ms."
+  [vm command & {:keys [cwd timeout-ms interrupt interrupt-poll-ms] :or {timeout-ms 300000}}]
   (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm)
             (exec-command vm command cwd)
-            :timeout-ms timeout-ms))
+            :timeout-ms timeout-ms :interrupt interrupt :interrupt-poll-ms interrupt-poll-ms))
 
 (defn exec!
   "Like exec but throws ex-info when the command exits non-zero (ex-data carries
-  :stdout/:stderr/:exit). Returns the result on success."
+  :stdout/:stderr/:exit) or is interrupted. Returns the result on success."
   [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
   (let [r (exec vm command :cwd cwd :timeout-ms timeout-ms)]
-    (when-not (zero? (:exit r))
-      (throw (ex-info (str "command failed (" (:exit r) "): " command) r)))
+    (when-not (zero? (or (:exit r) 1))
+      (throw (ex-info (str (if (:interrupted? r) "interrupted" (str "command failed (" (:exit r) ")")) ": " command) r)))
     r))
 
 (defn alive?
