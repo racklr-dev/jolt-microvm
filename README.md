@@ -85,8 +85,8 @@ A mount may carry `:readonly?` / `:ro` (boolean) or `:mode` `"ro"`/`"rw"`
 (default `rw`): a read-only mount is mounted `-o ro` in the guest, so the
 sandbox can read config but not write it.
 `:writable-home?` (default false) leaves the sandbox home writable so mounts can
-be created under `/home/sandbox`: e.g. mount the host `~/.faraday` there and
-faraday inside the exec reads the same settings. When off, the home stays
+be created under `/home/sandbox`: e.g. mount the host `~/.config` there and a
+guest tool reads the same settings. When off, the home stays
 non-writable to the sandbox user (sshd hygiene).
 
 `:nix-flake` layers a nix flake devShell into the VM: `start!` resolves it with
