@@ -3,6 +3,26 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.4.0 — 2026-11-24
+
+### Added
+
+- OS-aware `check!`: reports the host OS and whether a hardware
+  virtualization backend is available, and branches `:hypervisor`/`:kvm`
+  instead of assuming one. CI runs the matrix on linux/macos/windows.
+- Egress allow-list: `net-up!` gates DNS via dnsmasq and NATs only
+  allow-listed domains/ports; the rest sinkhole. e2e test covers allowed
+  resolves and sinkholed denies.
+- Nix devShell layering: `print-dev-env` + `/nix/store` mount + exec env
+  wrap, so a flake devShell is usable inside the sandbox.
+- Mid-command interrupt: `exec`/`exec!` poll an interrupt atom and kill the
+  ssh process while a command is running.
+
+### Fixed
+
+- Nix falls back to `/tmp` when `TMPDIR` points at a stale nix-shell dir.
+- Egress teardown keys ride the VM record, so `stop!` clears nftables/NAT.
+
 ## v1.3.0 — 2026-11-23
 
 ### Added
