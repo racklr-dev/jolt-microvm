@@ -82,12 +82,27 @@ a pre-flight check, and throws a readable error if something is missing.
 `:mounts` accepts a host→guest map, a vector of `{:host :guest :tag}` specs, or
 a vector of `[host guest]` pairs; each mount is a separate virtio-fs device.
 A mount may carry `:readonly?` / `:ro` (boolean) or `:mode` `"ro"`/`"rw"`
-(default `rw`) — a read-only mount is mounted `-o ro` in the guest, so the
+(default `rw`): a read-only mount is mounted `-o ro` in the guest, so the
 sandbox can read config but not write it.
 `:writable-home?` (default false) leaves the sandbox home writable so mounts can
-be created under `/home/sandbox` — e.g. mount the host `~/.faraday` there and
+be created under `/home/sandbox`: e.g. mount the host `~/.faraday` there and
 faraday inside the exec reads the same settings. When off, the home stays
 non-writable to the sandbox user (sshd hygiene).
+
+`:nix-flake` layers a nix flake devShell into the VM: `start!` resolves it with
+`nix print-dev-env` on the host, mounts the host `/nix/store` read-only at
+`/nix/store`, and wraps every `exec` in the devShell env (PATH + the flake's
+env vars) via the nix bash. Relative refs like `.#default` resolve against the
+`:workspace` dir (the project). Needs nix + flakes on the host; the first boot
+fetches/builds the devShell closure into `/nix/store`, then it is cached.
+
+```clojure
+(vm/with-vm [v {:image "alpine:3.20"
+                :workspace "/path/to/your/project"   ; the dir with flake.nix
+                :nix-flake ".#default"}]
+  (vm/exec v "gcc --version")          ; the flake's stdenv toolchain
+  (vm/exec v "hello"))                 ; a package from the devShell
+```
 `:arch` overrides the host-architecture default (x86_64→amd64, aarch64→arm64).
 
 Direct-exec for distroless / shell-less images (no SSH, no shell):

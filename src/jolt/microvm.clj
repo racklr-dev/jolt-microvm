@@ -13,6 +13,7 @@
             [jolt.exec.client :as exec-client]
             [jolt.exec.bundle :as exec-bundle]
             [jolt.microvm.deps :as guest-deps]
+            [jolt.microvm.nix :as nix]
             [jolt.tapmasq :as net]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -196,7 +197,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file nix])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -286,7 +287,7 @@
   the workspace mount first (tag workspace, read-write). The workspace mounts at
   workspace-guest (default /workspace), so a host cwd can be mounted at its own
   absolute path and pwd in the guest shows the host path."
-  [workspace mounts workspace-guest]
+  [workspace mounts workspace-guest & [extra]]
   (let [user (cond
                (nil? mounts) []
                (map? mounts)
@@ -316,7 +317,8 @@
                          (cond-> {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}
                            ro (assoc :readonly? true))))
                      (range) user)]
-    (into [{:tag "workspace" :host workspace :guest (or workspace-guest "/workspace")}] tagged)))
+    (into [{:tag "workspace" :host workspace :guest (or workspace-guest "/workspace")}]
+          (concat (or extra []) tagged))))
 
 ;; -- networking helpers ------------------------------------------------------
 (def ^:private net-seq (atom 0))
@@ -367,6 +369,10 @@
     :image       required, e.g. \"alpine:3.20\" (multi-arch resolves host arch)
     :arch        guest arch override (e.g. \"arm64\")
     :packages    apk packages to pre-install into the cached base [\"python3\"]
+    :nix-flake   flake devShell ref to layer in (relative refs like .#default
+                   resolve against the workspace): resolved via nix
+                   print-dev-env, the closure is mounted read-only at /nix/store,
+                   and every exec is sourced into the devShell env
     :workspace   host dir mounted at /workspace (default rootfs/workspace)
     :workspace-guest guest path to mount :workspace at (default /workspace);
                    set it to the host cwd's absolute path so guest pwd matches
@@ -382,15 +388,20 @@
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
         _ (ensure-base! image cache-dir (distinct (concat packages (:apk declared))) arch)
+        nix-resolved (when nix-flake (nix/resolve! nix-flake cache-dir (or workspace (System/getProperty "user.dir"))))
+        nix-mount (when nix-resolved {:tag "nix-store" :host "/nix/store" :guest "/nix/store" :readonly? true})
         rootfs (rootfs/prepare! image cache-dir arch)
+        _ (when nix-resolved
+            (.mkdirs (File. (str rootfs "/etc/jolt")))
+            (spit (str rootfs "/etc/jolt/dev-env.sh") (:env-script nix-resolved)))
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
-        mounts (normalize-mounts ws mounts workspace-guest)
+        mounts (normalize-mounts ws mounts workspace-guest (when nix-mount [nix-mount]))
         ephemeral (keys/generate-ephemeral!)
         host (keys/generate-host!)
         _ (rootfs/inject-sandbox-user! rootfs)
@@ -410,18 +421,36 @@
       (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
             _ (wait-for-tcp! ip 22 30000)]
         (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
-              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)))
+              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net) nix-resolved))
       (catch Exception e
         (.destroyForcibly proc)
         (net-down! net)
         (throw e)))))
+
+(defn- shq
+  "Single-quote a string for embedding in a shell command, escaping embedded
+  single quotes so the reconstructed word is verbatim."
+  [s]
+  (str "'" (str/replace s "'" "'\\''") "'"))
+
+(defn- exec-command
+  "The remote shell command for a VM exec. When the VM carries :nix (a resolved
+  flake devShell), the command is sourced into the devShell env by the nix bash
+  before running, so PATH and the flake's env vars apply; otherwise the command
+  runs under the guest's default shell as before."
+  [vm command cwd]
+  (let [cwd (or cwd (get-in vm [:opts :workspace-guest]) "/workspace")]
+    (if-let [nix (:nix vm)]
+      (str (:bash nix) " -c "
+           (shq (str "source /etc/jolt/dev-env.sh && cd " (shq cwd) " && " command)))
+      (str "cd " cwd " && " command))))
 
 (defn exec
   "Run a command in the VM. Returns {:stdout :stderr :exit}.
   opts: :cwd (default the workspace's guest path), :timeout-ms (default 300000)."
   [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
   (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm)
-            (str "cd " (or cwd (get-in vm [:opts :workspace-guest]) "/workspace") " && " command)
+            (exec-command vm command cwd)
             :timeout-ms timeout-ms))
 
 (defn exec!
