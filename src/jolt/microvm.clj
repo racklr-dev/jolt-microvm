@@ -344,35 +344,62 @@
 (defn- mac-str [seq]
   (format "02:00:00:00:00:%02x" (mod seq 255)))
 
-(defn- net-up! [cache-dir]
+(defn- egress-iface
+  "The host interface that reaches the internet (e.g. enp1s0)."
+  []
+  (-> (shell/sh "sh" "-c"
+                "ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
+      :out str/trim))
+
+(defn- net-up! [cache-dir & {:keys [egress]}]
   "Create one VM's own TAP + dnsmasq on its own /24 subnet (10.44.<n>.1/24),
   so concurrent start! calls multiplex without fighting over a shared device.
-  Returns {:tap :mac-str :mac-bytes :lease-file :pid-file}."
+  When :egress carries :allow-domains, also wire DNS domain-gating (dnsmasq),
+  default-deny nftables (:allow-ports, default [80 443]) and NAT masquerade.
+  Returns {:tap :mac-str :mac-bytes :lease-file :pid-file} plus teardown keys."
   (locking net-lock
     (let [seq (swap! net-seq inc)
           tap (str "jolt" seq)
           host-ip (format "10.44.%d.1" seq)
           host-cidr (str host-ip "/24")
+          subnet (format "10.44.%d.0/24" seq)
           config-file (str cache-dir "/dnsmasq-" seq ".conf")
           pid-file (str cache-dir "/dnsmasq-" seq ".pid")
           lease-file (str cache-dir "/dnsmasq-" seq ".leases")
-          log-file (str cache-dir "/dnsmasq-" seq ".log")]
+          log-file (str cache-dir "/dnsmasq-" seq ".log")
+          rules-file (str cache-dir "/nft-" seq ".rules")
+          allow-domains (seq (:allow-domains egress))
+          iface (when allow-domains (or (:egress-iface egress) (egress-iface)))]
       (.mkdirs (java.io.File. cache-dir))
       (net/tap-create! tap)
       (net/tap-ip! tap host-cidr)
       (spit config-file (net/dnsmasq-config {:interface tap :subnet-cidr host-cidr
                                              :range-start (format "10.44.%d.10" seq)
                                              :range-end (format "10.44.%d.100" seq)
-                                             :dns host-ip}))
+                                             :dns host-ip
+                                             :upstream (or (:upstream egress) "1.1.1.1")
+                                             :allow-domains allow-domains}))
       (net/dnsmasq-start! {:config-file config-file :pid-file pid-file
                            :lease-file lease-file :log-file log-file})
-      {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq)
-       :lease-file lease-file :pid-file pid-file})))
+      (when allow-domains
+        (net/ip-forward! true)
+        (net/nftables-apply! {:table (str "jolt" seq) :subnet subnet :dns host-ip
+                              :allow-cidrs (:allow-cidrs egress)
+                              :allow-ports (or (:allow-ports egress) [80 443])
+                              :rules-file rules-file})
+        (net/nat-enable! subnet iface))
+      (cond-> {:tap tap :mac-str (mac-str seq) :mac-bytes (mac-bytes seq)
+               :lease-file lease-file :pid-file pid-file}
+        allow-domains (assoc :table (str "jolt" seq) :rules-file rules-file
+                             :subnet subnet :egress-iface iface)))))
 
 (defn- net-down! [net]
-  "Tear down one VM's TAP + dnsmasq."
+  "Tear down one VM's TAP + dnsmasq (+ nftables/NAT when egress was wired)."
   (net/dnsmasq-stop! (:pid-file net))
   (net/tap-delete! (:tap net))
+  (when (:table net)
+    (net/nftables-clear! (:table net))
+    (net/nat-disable! (:subnet net) (:egress-iface net)))
   :stopped)
 
 (defn start!
@@ -399,10 +426,19 @@
     A mount entry may also carry :readonly? / :ro (boolean) or :mode
     \"ro\"/\"rw\" (default rw); a readonly mount is mounted -o ro in the guest.
     :cache-dir   (default ~/.cache/jolt-microvm)
+    :egress      optional managed-egress map:
+                   {:allow-domains [github.com ...]   DNS-gated allow-list
+                    :allow-ports   [80 443]           tcp egress ports
+                    :allow-cidrs   [1.1.1.1/32]       optional ip allow-list
+                    :upstream      1.1.1.1            dnsmasq resolver}
+                 when :allow-domains is present, dnsmasq resolves only those
+                 domains (+subdomains) and sinkholes the rest, nftables default-
+                 denies the guest subnet except DNS + those ports, and NAT
+                 masquerades the allowed egress out the host's route
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -421,7 +457,7 @@
         _ (rootfs/inject-sandbox-user! rootfs)
         _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? writable-home?)
         _ (keys/inject-host! rootfs host)
-        net (net-up! cache-dir)
+        net (net-up! cache-dir :egress egress)
         exec-cmd (rootfs/sshd-exec-command mounts)
         cfg {"rootfs_path" rootfs
              "cpus" (or cpus 2)
