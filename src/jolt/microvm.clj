@@ -37,6 +37,9 @@
   []
   (let [lk (probe/find-libkrun)
         lkfw (probe/find-libkrunfw)
+        os (probe/host-os)
+        macos? (= os :macos)
+        hv-ok (probe/hypervisor-available?)
         kvm-present (probe/kvm-present?)
         kvm-writable (probe/kvm-available?)
         ssh (which "ssh")
@@ -48,18 +51,33 @@
         results
         [{:name :libkrun :status (if lk :ok :error)
           :message (or lk "libkrun shared library not found")
-          :fix (when-not lk "install libkrun (e.g. brew install libkrun, or dnf/apt install libkrun)")}
+          :fix (when-not lk
+                 (if macos?
+                   "brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw"
+                   "install libkrun (dnf/apt) or build from source"))}
          {:name :libkrunfw :status (if lkfw :ok :error)
           :message (or lkfw "libkrunfw shared library not found")
-          :fix (when-not lkfw "install libkrunfw (same package as libkrun on most distros)")}
-         {:name :kvm
-          :status (cond (not kvm-present) :error kvm-writable :ok :else :error)
-          :message (if (not kvm-present)
-                     "/dev/kvm not present"
-                     (if kvm-writable "/dev/kvm read+write ok" "/dev/kvm exists but is not writable"))
-          :fix (if (not kvm-present)
-                 "enable KVM in BIOS/host and load the kvm module"
-                 "add your user to the kvm group: sudo usermod -aG kvm $USER, then log out and back in")}
+          :fix (when-not lkfw
+                 (if macos?
+                   "brew tap libkrun/krun && brew trust libkrun/krun && brew install libkrun libkrunfw"
+                   "install libkrunfw (same package as libkrun on most distros)"))}
+         {:name (if macos? :hypervisor :kvm)
+          :status (cond
+                    macos? (if hv-ok :ok :error)
+                    (not kvm-present) :error
+                    kvm-writable :ok
+                    :else :error)
+          :message (cond
+                     macos? (if hv-ok
+                              "Hypervisor.framework available"
+                              "Hypervisor.framework not available (kern.hv_support=0)")
+                     (not kvm-present) "/dev/kvm not present"
+                     kvm-writable "/dev/kvm read+write ok"
+                     :else "/dev/kvm exists but is not writable")
+          :fix (cond
+                 macos? (when-not hv-ok "Hypervisor.framework requires Apple Silicon hardware")
+                 (not kvm-present) "enable KVM in BIOS/host and load the kvm module"
+                 :else "add your user to the kvm group: sudo usermod -aG kvm $USER, then log out and back in")}
          {:name :ssh :status (if ssh :ok :error)
           :message (or ssh "openssh client not found")
           :fix (when-not ssh "install openssh-client")}
