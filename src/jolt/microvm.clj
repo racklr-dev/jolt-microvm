@@ -211,7 +211,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file nix])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -471,7 +471,8 @@
       (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
             _ (wait-for-tcp! ip 22 30000)]
         (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
-              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net) nix-resolved))
+              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
+              (:table net) (:subnet net) (:egress-iface net) nix-resolved))
       (catch Exception e
         (.destroyForcibly proc)
         (net-down! net)
