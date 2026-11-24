@@ -368,7 +368,7 @@
           lease-file (str cache-dir "/dnsmasq-" seq ".leases")
           log-file (str cache-dir "/dnsmasq-" seq ".log")
           rules-file (str cache-dir "/nft-" seq ".rules")
-          allow-domains (seq (:allow-domains egress))
+          allow-domains (not-empty (:allow-domains egress))
           iface (when allow-domains (or (:egress-iface egress) (egress-iface)))]
       (.mkdirs (java.io.File. cache-dir))
       (net/tap-create! tap)
