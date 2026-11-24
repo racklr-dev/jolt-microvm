@@ -39,6 +39,21 @@
     (let [p (str/trim (:out r))]
       (when (seq p) p))))
 
+(defn- sane-tmpdir*
+  "Given a TMPDIR candidate, return it when it exists and is writable, else /tmp."
+  [t]
+  (if (and t (.isDirectory (File. t)) (.canWrite (File. t)))
+    t
+    "/tmp"))
+
+(defn- sane-tmpdir
+  "A TMPDIR that exists and is writable, from the process env. A stale nix-shell
+  leaves TMPDIR pointing at a deleted /tmp/nix-shell.* dir, which breaks
+  `nix print-dev-env` (it tries to mkdir a child and fails with ENOENT); fall
+  back to /tmp then."
+  []
+  (sane-tmpdir* (or (System/getenv "TMPDIR") (System/getenv "TMP") "/tmp")))
+
 (defn- write-atomically!
   "Write text to path via a temp file + atomic rename (avoids torn reads from
   concurrent resolvers)."
@@ -73,7 +88,10 @@
         (.mkdirs (File. dir))
         (let [r (shell/sh nix-bin "--extra-experimental-features" "nix-command flakes"
                           "print-dev-env" ref
-                          :dir (or flake-dir (System/getProperty "user.dir")))]
+                          :dir (or flake-dir (System/getProperty "user.dir"))
+                          :env (let [e (System/getenv)
+                                     t (sane-tmpdir)]
+                                 (assoc e "TMPDIR" t "TMP" t)))]
           (when-not (zero? (:exit r))
             (throw (ex-info (str "nix print-dev-env failed: " (str/trim (:err r)))
                             {:ref ref :stderr (:err r)})))
