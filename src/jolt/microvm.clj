@@ -283,8 +283,10 @@
 
 (defn- normalize-mounts
   "Normalize :mounts to [{:tag :host :guest :readonly?} ...], always including
-  the workspace mount first (tag workspace, guest /workspace, read-write)."
-  [workspace mounts]
+  the workspace mount first (tag workspace, read-write). The workspace mounts at
+  workspace-guest (default /workspace), so a host cwd can be mounted at its own
+  absolute path and pwd in the guest shows the host path."
+  [workspace mounts workspace-guest]
   (let [user (cond
                (nil? mounts) []
                (map? mounts)
@@ -314,7 +316,7 @@
                          (cond-> {:tag (or (:tag m) (str "mnt" i)) :host h :guest g}
                            ro (assoc :readonly? true))))
                      (range) user)]
-    (into [{:tag "workspace" :host workspace :guest "/workspace"}] tagged)))
+    (into [{:tag "workspace" :host workspace :guest (or workspace-guest "/workspace")}] tagged)))
 
 ;; -- networking helpers ------------------------------------------------------
 (def ^:private net-seq (atom 0))
@@ -366,6 +368,8 @@
     :arch        guest arch override (e.g. \"arm64\")
     :packages    apk packages to pre-install into the cached base [\"python3\"]
     :workspace   host dir mounted at /workspace (default rootfs/workspace)
+    :workspace-guest guest path to mount :workspace at (default /workspace);
+                   set it to the host cwd's absolute path so guest pwd matches
     :mounts      extra volume mounts:
                    { \"/host/dir\" \"/guest/dir\" }   (host->guest map)
                    [{:host :guest :tag}]              (vector of specs)
@@ -378,7 +382,7 @@
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home?] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -386,7 +390,7 @@
         rootfs (rootfs/prepare! image cache-dir arch)
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
-        mounts (normalize-mounts ws mounts)
+        mounts (normalize-mounts ws mounts workspace-guest)
         ephemeral (keys/generate-ephemeral!)
         host (keys/generate-host!)
         _ (rootfs/inject-sandbox-user! rootfs)
@@ -414,16 +418,16 @@
 
 (defn exec
   "Run a command in the VM. Returns {:stdout :stderr :exit}.
-  opts: :cwd (default /workspace), :timeout-ms (default 300000)."
-  [vm command & {:keys [cwd timeout-ms] :or {cwd "/workspace" timeout-ms 300000}}]
+  opts: :cwd (default the workspace's guest path), :timeout-ms (default 300000)."
+  [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
   (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm)
-            (str "cd " cwd " && " command)
+            (str "cd " (or cwd (get-in vm [:opts :workspace-guest]) "/workspace") " && " command)
             :timeout-ms timeout-ms))
 
 (defn exec!
   "Like exec but throws ex-info when the command exits non-zero (ex-data carries
   :stdout/:stderr/:exit). Returns the result on success."
-  [vm command & {:keys [cwd timeout-ms] :or {cwd "/workspace" timeout-ms 300000}}]
+  [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
   (let [r (exec vm command :cwd cwd :timeout-ms timeout-ms)]
     (when-not (zero? (:exit r))
       (throw (ex-info (str "command failed (" (:exit r) "): " command) r)))

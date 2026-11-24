@@ -3,6 +3,16 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.3.0 — 2026-11-23
+
+### Added
+
+- `start!` opt `:workspace-guest`: mount the workspace at a custom guest path
+  (default `/workspace`). Set it to the host cwd's absolute path and guest `pwd`
+  shows the host path, so relative paths read naturally. `exec`/`exec!` default
+  their cwd to the workspace's guest path.
+- `test/jolt/workspace_guest_test.clj`.
+
 ## v1.2.1 — 2026-11-23
 
 ### Fixed
