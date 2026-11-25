@@ -1,5 +1,5 @@
 ;; QoL integration test: :packages auto-install (python3), extra volume mount,
-;; copy-to!/copy-from!, exec!, with-vm, alive?/info.
+;; exec!, with-vm, alive?/info. (No file-copy surface — config only.)
 ;; Run under a user with kvm group access (see README).
 (ns jolt.test.qol
   (:require [jolt.microvm :as vm]
@@ -30,16 +30,6 @@
 (assert (zero? (:exit (vm/exec v "echo mount-ok > /data/from-vm.txt"))))
 (assert (= "mount-ok\n" (slurp (str extra "/from-vm.txt"))))
 
-;; copy-to! (host -> guest) and read back in guest
-(spit (str workspace "/host-src.txt") "host-data\n")
-(assert (zero? (:exit (vm/copy-to! v (str workspace "/host-src.txt") "/workspace/copied-in.txt"))))
-(assert (str/includes? (:stdout (vm/exec v "cat /workspace/copied-in.txt")) "host-data"))
-
-;; copy-from! (guest -> host)
-(assert (zero? (:exit (vm/exec v "echo guest-data > /workspace/guest-src.txt"))))
-(assert (zero? (:exit (vm/copy-from! v "/workspace/guest-src.txt" (str workspace "/guest-out.txt")))))
-(assert (= "guest-data\n" (slurp (str workspace "/guest-out.txt"))))
-
 ;; exec! throws on nonzero, returns on success
 (try
   (vm/exec! v "sh -c 'echo boom >&2; exit 3'")
@@ -67,4 +57,4 @@
                   true)]
   (assert stopped?))
 
-(println "jolt-microvm: packages + extra mount + copy + exec! + with-vm OK")
+(println "jolt-microvm: packages + extra mount + exec! + with-vm OK")

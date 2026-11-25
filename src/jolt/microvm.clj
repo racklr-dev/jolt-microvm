@@ -43,7 +43,6 @@
         kvm-present (probe/kvm-present?)
         kvm-writable (probe/kvm-available?)
         ssh (which "ssh")
-        scp (which "scp")
         keygen (which "ssh-keygen")
         sudo (which "sudo")
         jolt (or (System/getenv "JOLT_BIN")
@@ -81,9 +80,6 @@
          {:name :ssh :status (if ssh :ok :error)
           :message (or ssh "openssh client not found")
           :fix (when-not ssh "install openssh-client")}
-         {:name :scp :status (if scp :ok :warn)
-          :message (or scp "scp not found (copy-to!/copy-from! unavailable)")
-          :fix (when-not scp "install openssh-client")}
          {:name :ssh-keygen :status (if keygen :ok :error)
           :message (or keygen "ssh-keygen not found")
           :fix (when-not keygen "install openssh-client")}
@@ -548,36 +544,10 @@
    :mounts (:mounts vm)
    :running? (alive? vm)})
 
-(defn- scp
-  "Run scp against the VM with the host key pinned. Returns {:stdout :stderr :exit}."
-  [vm & args]
-  (let [known (known-hosts-path! (:ip vm) (:host-public-key vm))]
-    (try
-      (let [argv (into-array String (concat ["scp" "-i" (:private-key-path vm)
-                                             "-P" "22"
-                                             "-o" "StrictHostKeyChecking=yes"
-                                             "-o" (str "UserKnownHostsFile=" known)
-                                             "-o" "BatchMode=yes"
-                                             "-o" "LogLevel=ERROR"]
-                                            (ssh-mux-args (:ip vm))
-                                            args))
-            proc (.start (ProcessBuilder. argv))
-            out (future (drain! (.getInputStream proc)))
-            err (future (drain! (.getErrorStream proc)))
-            code (.waitFor proc)]
-        {:stdout @out :stderr @err :exit code})
-      (finally (.delete (java.io.File. known))))))
-
-(defn copy-to!
-  "Copy a host file or dir into the guest (recursive). Returns the scp result."
-  [vm host-path guest-path]
-  (scp vm "-r" host-path (str "sandbox@127.0.0.1:" guest-path)))
-
-(defn copy-from!
-  "Copy a guest file or dir out of the VM (recursive). Returns the scp result."
-  [vm guest-path host-path]
-  (scp vm "-r" (str "sandbox@127.0.0.1:" guest-path) host-path))
-
+;; No SCP/file-transfer surface: the sandbox is configured declaratively
+;; (settings.json -> :packages / :nix-flake -> baked into the rootfs/dev-env
+;; at boot). Dependencies are added by editing that config, never by copying
+;; files into a running VM.
 (defn install-image!
   "Install apk packages into the cached base for image; takes effect on the
   next start!. Returns :installed."
