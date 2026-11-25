@@ -492,6 +492,16 @@
         _ (when nix-resolved
             (.mkdirs (File. (str rootfs "/etc/jolt")))
             (spit (str rootfs "/etc/jolt/dev-env.sh") (:env-script nix-resolved)))
+        ;; Bake the static devShell env into the login profile too, so a
+        ;; `bash -lc` / `sh -l` (login shell) picks it up: /etc/profile sets a
+        ;; bare PATH then sources /etc/profile.d/*.sh, and the agent habitually
+        ;; wraps commands in a login shell.
+        _ (when (and nix-resolved (:path nix-resolved))
+            (.mkdirs (File. (str rootfs "/etc/profile.d")))
+            (spit (str rootfs "/etc/profile.d/jolt-dev-env.sh")
+                  (str "export PATH=" (:path nix-resolved) "${PATH:+:$PATH}\n"
+                       (when (:ld-library-path nix-resolved)
+                         (str "export LD_LIBRARY_PATH=" (:ld-library-path nix-resolved) "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n")))))
         ws (or workspace (str rootfs "/workspace"))
         _ (.mkdirs (File. ws))
         mounts (normalize-mounts ws mounts workspace-guest (when nix-mount [nix-mount]))
