@@ -534,14 +534,21 @@
 
 (defn- exec-command
   "The remote shell command for a VM exec. When the VM carries :nix (a resolved
-  flake devShell), the command is sourced into the devShell env by the nix bash
-  before running, so PATH and the flake's env vars apply; otherwise the command
-  runs under the guest's default shell as before."
+  flake devShell), the STATIC environment is exported directly (PATH and
+  LD_LIBRARY_PATH were extracted once at resolve time) — the full nix-shell
+  activation script is never re-sourced per exec, so the devShell cannot flake
+  out mid-session. Falls back to sourcing the script only if the static env was
+  not extracted."
   [vm command cwd]
   (let [cwd (or cwd (get-in vm [:opts :workspace-guest]) "/workspace")]
     (if-let [nix (:nix vm)]
-      (str (:bash nix) " -c "
-           (shq (str "source /etc/jolt/dev-env.sh && cd " (shq cwd) " && " command)))
+      (let [env (if (:path nix)
+                  (str "export PATH=" (shq (:path nix))
+                       (when (:ld-library-path nix)
+                         (str " && export LD_LIBRARY_PATH=" (shq (:ld-library-path nix)))))
+                  (str "source /etc/jolt/dev-env.sh"))]
+        (str (:bash nix) " -c "
+             (shq (str env " && cd " (shq cwd) " && " command))))
       (str "cd " cwd " && " command))))
 
 (defn exec

@@ -101,6 +101,9 @@
               (throw (ex-info "nix devShell has no BASH in print-dev-env output" {:ref ref})))
             (write-atomically! env-file script)
             (write-atomically! bash-file bash))))
-      {:env-script (slurp env-file)
-       :bash (str/trim (slurp bash-file))
-       :flake-dir flake-dir})))
+      (let [script (slurp env-file)]
+        {:env-script script
+         :bash (str/trim (slurp bash-file))
+         :path (second (re-find #"(?m)^PATH='([^']*)'" script))
+         :ld-library-path (second (re-find #"LD_LIBRARY_PATH=([^$;\n]+)" script))
+         :flake-dir flake-dir}))))
