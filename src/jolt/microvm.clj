@@ -184,7 +184,12 @@
             err (future (drain! (.getErrorStream proc)))]
         (loop [deadline (+ (System/currentTimeMillis) timeout-ms)]
           (if (.waitFor proc interrupt-poll-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-            {:stdout @out :stderr @err :exit (.exitValue proc)}
+            (let [r {:stdout @out :stderr @err :exit (.exitValue proc)}]
+              ;; ssh exit 255 = connection failure. Drop the persistent
+              ;; control socket so the next exec does not reuse a dead mux.
+              (when (= 255 (:exit r))
+                (.delete (java.io.File. (ssh-control-path host))))
+              r)
             (cond
               (and interrupt @interrupt)
               (do (.destroyForcibly proc)
