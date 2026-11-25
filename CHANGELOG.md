@@ -3,6 +3,12 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.4.1 — 2026-11-24
+
+### Changed
+
+- Bump jolt-oci to v0.3.3 (retry transient registry failures, status-check authed GETs).
+
 ## v1.4.0 — 2026-11-24
 
 ### Added

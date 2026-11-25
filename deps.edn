@@ -9,7 +9,7 @@
          :git/sha "03267126e0bebe172936e9618b9ff6cd678edaac"}
         jolt-lang/jolt-oci
         {:git/url "https://github.com/racklr-dev/jolt-oci"
-         :git/sha "8a36c30d031edc65ba920e827ca35c69eac07caf"}
+         :git/sha "7b9874f3e0302b03e28713531e1ad73a796deef6"}
         jolt-lang/jolt-libkrun
         {:git/url "https://github.com/racklr-dev/jolt-libkrun"
          :git/sha "1e6dc52f7730c92b210456fd0bcb37272995859f"}
