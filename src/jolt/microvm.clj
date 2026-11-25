@@ -349,8 +349,37 @@
           (concat (or extra []) tagged))))
 
 ;; -- networking helpers ------------------------------------------------------
-(def ^:private net-seq (atom 0))
 (def ^:private net-lock (Object.))
+
+(defn- next-net-seq!
+  "The next host-wide VM network sequence: tap jolt<N>, subnet 10.44.<N>.0/24,
+  dnsmasq-<N>. Backed by a locked counter file in the host tmp dir so separate
+  jolt processes multiplex instead of colliding on jolt1 / 10.44.1.x."
+  []
+  (let [f (java.io.File. (str (System/getProperty "java.io.tmpdir") "/jolt-microvm-net-seq"))]
+    (.createNewFile f)
+    (with-open [ch (java.nio.channels.FileChannel/open
+                    (.toPath f)
+                    (into-array java.nio.file.OpenOption
+                                [java.nio.file.StandardOpenOption/READ
+                                 java.nio.file.StandardOpenOption/WRITE
+                                 java.nio.file.StandardOpenOption/CREATE]))]
+      (let [lock (.lock ch)]
+        (try
+          (let [size (.size ch)
+                cur (if (pos? size)
+                      (try
+                        (let [bytes (byte-array (int size))]
+                          (.read ch (java.nio.ByteBuffer/wrap bytes))
+                          (Long/parseLong (str/trim (String. bytes "UTF-8"))))
+                        (catch Exception _ 0))
+                      0)
+                next (inc cur)]
+            (.truncate ch 0)
+            (.position ch 0)
+            (.write ch (java.nio.ByteBuffer/wrap (.getBytes (str next) "UTF-8")))
+            next)
+          (finally (.release lock)))))))
 
 (defn- mac-bytes [seq]
   (byte-array [2 0 0 0 0 (mod seq 255)]))
@@ -372,7 +401,7 @@
   default-deny nftables (:allow-ports, default [80 443]) and NAT masquerade.
   Returns {:tap :mac-str :mac-bytes :lease-file :pid-file} plus teardown keys."
   (locking net-lock
-    (let [seq (swap! net-seq inc)
+    (let [seq (next-net-seq!)
           tap (str "jolt" seq)
           host-ip (format "10.44.%d.1" seq)
           host-cidr (str host-ip "/24")
