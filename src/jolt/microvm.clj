@@ -500,26 +500,31 @@
         _ (rootfs/inject-sandbox-user! rootfs)
         _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? writable-home?)
         _ (keys/inject-host! rootfs host)
-        net (net-up! cache-dir :egress egress)
         exec-cmd (rootfs/sshd-exec-command mounts)
-        cfg {"rootfs_path" rootfs
-             "cpus" (or cpus 2)
-             "memory_mib" (or memory-mib 512)
-             "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m)}) mounts)
-             "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
-             "exec" exec-cmd
-             "dhcp" true}
-        proc (spawn-runner! project-dir cfg)]
-    (try
-      (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
-            _ (wait-for-tcp! ip 22 30000)]
-        (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
-              proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
-              (:table net) (:subnet net) (:egress-iface net) nix-resolved))
-      (catch Exception e
-        (.destroyForcibly proc)
-        (net-down! net)
-        (throw e)))))
+        boot-attempt (fn boot-attempt [attempt]
+                       (let [net (net-up! cache-dir :egress egress)
+                             cfg {"rootfs_path" rootfs
+                                  "cpus" (or cpus 2)
+                                  "memory_mib" (or memory-mib 512)
+                                  "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m)}) mounts)
+                                  "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
+                                  "exec" exec-cmd
+                                  "dhcp" true}
+                             proc (spawn-runner! project-dir cfg)]
+                         (try
+                           (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
+                                 _ (wait-for-tcp! ip 22 30000)]
+                             (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
+                                   proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
+                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved))
+                           (catch Exception e
+                             (.destroyForcibly proc)
+                             (net-down! net)
+                             (if (and (str/includes? (str (ex-message e)) "DHCP lease")
+                                      (< attempt 3))
+                               (boot-attempt (inc attempt))
+                               (throw e))))))]
+    (boot-attempt 1)))
 
 (defn- shq
   "Single-quote a string for embedding in a shell command, escaping embedded
