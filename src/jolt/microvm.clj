@@ -356,30 +356,25 @@
   dnsmasq-<N>. Backed by a locked counter file in the host tmp dir so separate
   jolt processes multiplex instead of colliding on jolt1 / 10.44.1.x."
   []
-  (let [f (java.io.File. (str (System/getProperty "java.io.tmpdir") "/jolt-microvm-net-seq"))]
-    (.createNewFile f)
-    (with-open [ch (java.nio.channels.FileChannel/open
-                    (.toPath f)
-                    (into-array java.nio.file.OpenOption
-                                [java.nio.file.StandardOpenOption/READ
-                                 java.nio.file.StandardOpenOption/WRITE
-                                 java.nio.file.StandardOpenOption/CREATE]))]
-      (let [lock (.lock ch)]
-        (try
-          (let [size (.size ch)
-                cur (if (pos? size)
-                      (try
-                        (let [bytes (byte-array (int size))]
-                          (.read ch (java.nio.ByteBuffer/wrap bytes))
-                          (Long/parseLong (str/trim (String. bytes "UTF-8"))))
-                        (catch Exception _ 0))
-                      0)
-                next (inc cur)]
-            (.truncate ch 0)
-            (.position ch 0)
-            (.write ch (java.nio.ByteBuffer/wrap (.getBytes (str next) "UTF-8")))
-            next)
-          (finally (.release lock)))))))
+  (let [f (java.io.File. (str (System/getProperty "java.io.tmpdir") "/jolt-microvm-net-seq"))
+        lock-dir (java.io.File. (str f ".lock"))]
+    (.mkdirs (.getParentFile lock-dir))
+    (loop []
+      (let [created? (try (java.nio.file.Files/createDirectory (.toPath lock-dir))
+                          true
+                          (catch Exception _ false))]
+        (cond
+          created?
+          (try
+            (let [cur (try (Long/parseLong (str/trim (slurp (str f))))
+                           (catch Exception _ 0))
+                  next (inc cur)]
+              (spit (str f) (str next))
+              next)
+            (finally (java.nio.file.Files/deleteIfExists (.toPath lock-dir))))
+
+          :else
+          (do (Thread/sleep 50) (recur)))))))
 
 (defn- mac-bytes [seq]
   (byte-array [2 0 0 0 0 (mod seq 255)]))
