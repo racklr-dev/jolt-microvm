@@ -161,6 +161,7 @@
                                   mounts))
         cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"
                  (when (seq mount-cmds) (str " && " mount-cmds))
+                 " && mount -t tmpfs -o mode=1777 tmpfs /tmp "
                  " && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
                  "&& exec " sshd " -D -e -o StrictModes=no")]
     ["/bin/sh" "-c" cmd]))
