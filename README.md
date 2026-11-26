@@ -211,3 +211,4 @@ EPL-2.0
 - [libkrun](https://github.com/containers/libkrun) — the microVM runtime
 - [jolt-libkrun](https://github.com/racklr-dev/jolt-libkrun) — the krun_* bindings this drives
 - [jolt-oci](https://github.com/racklr-dev/jolt-oci) — the image pull + unpack layer
+- [Benchmarks](docs/benchmarks.md) — measured SSH-exec vs daemon-exec throughput
