@@ -171,11 +171,20 @@
             pkgs.util-linux
             pkgs.xauth
           ];
+          # Native shared objects the nix-built jolt dlopens by soname at
+          # runtime (a nix jolt cannot open the host's glibc-linked copies).
+          nativeLibs = pkgs.lib.makeLibraryPath [
+            pkgs.openssl
+            pkgs.zlib
+            pkgs.zstd
+            pkgs.sqlite
+            pkgs.ncurses
+          ];
           mk-app =
             name: script:
             pkgs.writeShellScript name ''
               export PATH="${toolPath}:/usr/bin:/usr/sbin:/bin:/sbin"
-              export LD_LIBRARY_PATH="${lk}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${lk}/lib:${nativeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export JOLT_LIBKRUN_DIR="${lk}/lib"
               export JOLT_LIBKRUN_INIT="${lk}/bin/krun-init"
               export JOLT_BIN="${j}/bin/jolt"
@@ -187,10 +196,10 @@
           x11-app = mk-app "jolt-desktop-x11-app" "examples/desktop/x11-app.clj";
         in
         {
-          desktop-x11 = { type = "app"; program = "${x11}/bin/jolt-desktop-x11"; };
-          desktop-wayland = { type = "app"; program = "${wayland}/bin/jolt-desktop-wayland"; };
-          desktop-x11-app = { type = "app"; program = "${x11-app}/bin/jolt-desktop-x11-app"; };
-          default = { type = "app"; program = "${x11}/bin/jolt-desktop-x11"; };
+          desktop-x11 = { type = "app"; program = "${x11}"; };
+          desktop-wayland = { type = "app"; program = "${wayland}"; };
+          desktop-x11-app = { type = "app"; program = "${x11-app}"; };
+          default = { type = "app"; program = "${x11}"; };
         }
       );
 
@@ -217,7 +226,7 @@
 
             shellHook = ''
               export PATH="$PATH:/usr/bin:/usr/sbin:/bin:/sbin"
-              export LD_LIBRARY_PATH="${lk}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${lk}/lib:${pkgs.lib.makeLibraryPath [ pkgs.openssl pkgs.zlib pkgs.zstd pkgs.sqlite pkgs.ncurses ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export JOLT_LIBKRUN_DIR="${lk}/lib"
               export JOLT_LIBKRUN_INIT="${lk}/bin/krun-init"
               export JOLT_BIN="${j}/bin/jolt"
