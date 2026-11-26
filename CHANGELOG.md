@@ -3,6 +3,29 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.5.0 — 2026-11-25
+
+### Added
+
+- Alpine desktop examples: boot X11 or Wayland desktops in a microVM and serve
+  them over VNC at the guest TAP IP (`examples/desktop/x11.clj`, `wayland.clj`).
+- `jolt.microvm.desktop`: `profile` (apk package sets), `start-x11!`,
+  `start-wayland!`, `stop-desktop!` (software rendering via Xvfb / wlroots
+  headless+pixman, no GPU/display device needed).
+- `vm/x11-exec`: run a single guest X11 app on the host display via `ssh -X`
+  (`examples/desktop/x11-app.clj`).
+- `start!` opts `:x11?` / `:tcp-forward?`: inject the matching sshd_config and
+  make the sandbox home writable for xauth.
+- `test/jolt/desktop_test.clj`: boots both profiles and asserts the VNC `RFB`
+  banner.
+
+### Fixed
+
+- Raise the host runner's `RLIMIT_NOFILE` soft limit to 65536 (via `prlimit`,
+  Linux only): libkrun's virtio-fs opens guest shared libraries on the host,
+  and the Wayland desktop's library graph exceeded the common 1024-fd limit,
+  breaking VNC.
+
 ## v1.4.1 — 2026-11-24
 
 ### Changed
