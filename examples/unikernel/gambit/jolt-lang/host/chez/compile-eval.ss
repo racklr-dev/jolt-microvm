@@ -1,0 +1,1050 @@
+;; compile-eval.ss — the compile spine.
+;;
+;; Ties together the cross-compiled compiler image (jolt.ir + jolt.analyzer +
+;; jolt.backend-scheme, loaded as def-var! forms) and the host contract
+;; (host-contract.ss) into a runtime entry: a Clojure source string is read by the
+;; Chez data reader, analyzed by the analyzer to IR, emitted to Scheme by the
+;; emitter, and eval'd. This is the spine the stage2==stage3 bootstrap fixpoint
+;; closes over.
+;;
+;; Loaded after host-contract.ss + the compiler image.
+
+(define jolt-ce-analyze (var-deref "jolt.analyzer" "analyze"))
+(define jolt-ce-emit (var-deref "jolt.backend-scheme" "emit-top-form"))
+;; jolt.passes/run-passes: const-fold every analyzed form, plus inline + type
+;; inference when the unit opted into direct-linking (jolt build --opt). Off that
+;; path it is a pure const-fold. Loaded from the compiler image (jolt.passes).
+;; 2-arg run-passes makes its own fresh per-form inference context (this spine never
+;; optimizes, so it's unused anyway); build/emit-image use the 3-arg form to share the
+;; whole-program-seeded context across forms.
+(define jolt-ce-run-passes (var-deref "jolt.passes" "run-passes"))
+;; The compiler reads source as FORMS (set literals stay {:jolt/type :jolt/set},
+;; which the analyzer lowers) — the raw reader, not clojure.core/read-string,
+;; whose data conversion would turn those into real sets.
+;; Source text read for compiling, so its lists carry the positions a
+;; Compiler.load of the text would give (reader.ss rdr-data-pos); read-string's
+;; own read carries none, as the reference's does.
+(define (jolt-ce-read s) (parameterize ((rdr-data-pos #t)) (jolt-read-form-raw s)))
+
+;; --- current source location ------------------------------------------------
+;; The position of the top-level form currently compiling/evaluating, so an
+;; uncaught error can report where it came from (cli.ss jolt-report-uncaught).
+;; Thread-local: a future/agent worker tracks its own form. Holds #f or a
+;; {:line :column :file?} position map (jolt.host/form-position's shape).
+;; Top-level granularity — one set per top-level form, nothing per call.
+(define jolt-current-source (make-thread-parameter #f))
+;; AOT compile-cache capture port (#f or an open output string port), set by
+;; loader.ss aot-capture-load. When set, jolt-compile-eval-form* tees each form's
+;; emitted Scheme here so a cache miss records exactly what was eval'd (preserving
+;; the interleaved analyze→eval semantics the cache later replays via `load`).
+(define jolt-aot-capture (make-thread-parameter #f))
+;; The file that capture port was opened FOR. load-jolt-file* tees only while
+;; loading that file: a nested load must not append its forms to the requiring
+;; namespace's artifact, because the artifact already re-runs the require that
+;; pulls it in. See load-jolt-file* for what leaked before this existed.
+(define jolt-aot-capture-file (make-thread-parameter #f))
+;; A def that replaces a refer warns at analysis (host-contract.ss hc-intern!);
+;; the captured Scheme carries the same line so a cached load prints it too.
+(set-hc-replacement-recorder!
+  (lambda (msg)
+    (let ((cap (jolt-aot-capture)))
+      (when cap
+        (put-string cap "(ns-err-println ")
+        (write msg cap)
+        (put-string cap ")\n")))))
+
+;; clojure.lang.Compiler/LINE and /COLUMN — derefable cells (Vars on the JVM)
+;; holding the line/column of the form being compiled. Macros read @Compiler/LINE
+;; as a fallback when &form carries no position (jolt's reader stamps :line on list
+;; forms, so this is rarely hit). Updated per top-level form, like *current-source*.
+(define compiler-line-cell (jolt-atom-new 0))
+(define compiler-column-cell (jolt-atom-new 0))
+;; clojure.lang.Compiler/specials — the JVM's special-form table (sym -> parser).
+;; tools.macro reads (keys Compiler/specials) to know which heads NOT to expand.
+;; Only the keys matter here; values are #t. The set matches Clojure 1.2/1.3.
+(define compiler-specials
+  (let ((unq '("def" "loop*" "recur" "if" "case*" "let*" "letfn*" "do" "fn*"
+               "quote" "var" "." "set!" "try" "monitor-enter" "monitor-exit"
+               "throw" "new" "&" "catch" "finally" "reify*" "deftype*")))
+    (fold-left (lambda (m s) (jolt-assoc1 m (jolt-symbol #f s) #t))
+               (jolt-assoc1 (jolt-hash-map) (jolt-symbol "clojure.core" "import*") #t)
+               unq)))
+;; Compiler/demunge (compiler-demunge) lives in java/host-class.ss beside
+;; class-munge-map: the runtime names a fn in an ArityException with it, and a
+;; built program carries no compiler.
+;; clojure.lang.Compiler/CHAR_MAP — the forward munge map (special char -> escape
+;; token) as a jolt map, which is what a Clojure caller reading the field expects.
+;; class-munge-map is already exactly that table; this only changes its shape.
+(define compiler-char-map
+  (fold-left (lambda (m pair) (jolt-assoc1 m (car pair) (cdr pair)))
+             (jolt-hash-map)
+             class-munge-map))
+
+;; clojure.lang.Compiler/munge — the forward direction, the same walk that names a
+;; fn's class (class-munge-name, java/host-class.ss) and over the same table.
+;; clojure.core/munge is this, and typedclojure asks it whether two var names
+;; compile to one class name — a question a dash-only munge answered wrong for
+;; every pair that meets only after escaping (a? and a_QMARK_).
+(define (compiler-munge s)
+  (class-munge-name (if (string? s) s (jolt-str-render-one s))))
+;; clojure.lang.Compiler/subsumes — does the parameter-type array c1 make a
+;; strictly better match than c2 (same length)? Every position must be equal, a
+;; reference type where c2 has a primitive, or assignable to c2's; at least one
+;; must differ. Compiler.java's rule, which SCI's reflector uses to choose among
+;; members of one arity.
+(define (compiler-subsumes c1 c2)
+  (let loop ((a (seq->list (jolt-seq c1))) (b (seq->list (jolt-seq c2))) (better #f))
+    (cond ((or (null? a) (null? b)) better)
+          ((equal? (class-key (car a)) (class-key (car b))) (loop (cdr a) (cdr b) better))
+          ((or (and (not (jclass-primitive? (car a))) (jclass-primitive? (car b)))
+               (jclass-name-assignable? (class-key (car b)) (class-key (car a))))
+           (loop (cdr a) (cdr b) #t))
+          (else #f))))
+;; clojure.lang.Compiler/eval — evaluate a form in the current namespace, which is
+;; clojure.core/eval below. typedclojure's analyzer calls the static directly
+;; ((. clojure.lang.Compiler (eval frm))) so a user rebinding of eval cannot
+;; recurse into it. The JVM's second arity takes a fresh-loader flag that has no
+;; counterpart here.
+(define (compiler-eval form . _)
+  (jolt-compile-eval-form form (chez-current-ns)))
+(let ((members (list (cons "LINE" compiler-line-cell) (cons "COLUMN" compiler-column-cell)
+                     (cons "specials" compiler-specials)
+                     (cons "CHAR_MAP" compiler-char-map)
+                     (cons "munge" compiler-munge)
+                     (cons "demunge" compiler-demunge)
+                     (cons "eval" compiler-eval)
+                     (cons "subsumes" compiler-subsumes))))
+  (register-class-statics! "Compiler" members)
+  (register-class-statics! "clojure.lang.Compiler" members))
+
+(define (jolt-enter-form! form)
+  (jolt-site-reset!)   ; a top-level form is a root (rt.ss)
+  (let ((p (hc-form-position form)))
+    (when (pmap? p)
+      (jolt-current-source p)
+      (let ((line (jolt-get p hc-kw-line jolt-nil)) (col (jolt-get p hc-kw-column jolt-nil)))
+        (jolt-atom-val-set! compiler-line-cell (if (jolt-nil? line) 0 line))
+        (jolt-atom-val-set! compiler-column-cell (if (jolt-nil? col) 0 col))))))
+
+;; Record that we are working on `path`, for a phase that walks a file WITHOUT
+;; evaluating its forms — `jolt build`'s require scan, its whole-program inference
+;; walk, its emit walk. Those never reach jolt-enter-form!, so an error in one used
+;; to be reported with no location at all: just "Unhandled exception" over a trace
+;; of runtime procedure names, with nothing saying which file was being read.
+;;
+;; A bare set, not a parameterize, because the reporter runs from the CLI's guard —
+;; OUTSIDE every dynamic binding the failing phase had established. A parameterized
+;; value is long gone by then; only a sticky one survives the unwind, which is the
+;; same reason jolt-enter-form! sets rather than binds (a file LOAD is different:
+;; its failing form's position travels with the throw — jolt-note-throw-source!
+;; below). Clears any leftover line/column: they belong to whatever was last
+;; evaluated, in some other file entirely.
+(define (jolt-enter-file! path)
+  (when (string? path)
+    (jolt-current-source (jolt-hash-map hc-kw-file path))))
+
+;; "file:line:col" for a form position, bare "file" for a file-only one (above), or
+;; #f for anything else.
+(define (jolt-source-position-string p)
+  (and (pmap? p)
+       (let ((line (jolt-get p hc-kw-line jolt-nil))
+             (col  (jolt-get p hc-kw-column jolt-nil))
+             (file (jolt-get p hc-kw-file jolt-nil)))
+         (if (jolt-nil? line)
+             (and (string? file) (jolt-display-path file))
+             (string-append
+               (if (jolt-nil? file) "" (string-append (jolt-display-path file) ":"))
+               (number->string line) ":"
+               (if (jolt-nil? col) "?" (number->string col)))))))
+(define (jolt-current-source-string)
+  (jolt-source-position-string (jolt-current-source)))
+;; The position of the top-level form this thread entered last, as a {:line
+;; :column [:file]} map, or nil. An nREPL eval reads it where it catches a
+;; failure, to say which form of the eval'd text failed (the "(REPL:3)" of
+;; clojure.main's err->msg) when no frame of the user's own names a line.
+(def-var! "jolt.host" "current-source-position"
+  (lambda () (or (jolt-current-source) jolt-nil)))
+
+;; --- where a throwable happened -----------------------------------------
+;; jolt-current-source answers what is evaluating NOW. A throw that crosses a
+;; file load unwinds to the requiring form, and load-jolt-file* (loader.ss) binds
+;; the position around the file, so it unwinds too; the report still wants the
+;; form that FAILED, so that position travels with the throw instead. The
+;; innermost load a raise passes through records (raised-object . position)
+;; here — from its exception handler, before the stack unwinds — and the report
+;; asks for it back by the object's identity. A throw caught on the way leaves a
+;; record nobody asks for, and blames nothing on that file afterwards: while the
+;; position simply stayed put on a throw, a data_readers namespace that failed
+;; on a Joda class put "at .../clj_time/core.clj:254:1" under every later,
+;; unrelated error in the process, the CLI's own argument errors included.
+(define jolt-throw-source (make-thread-parameter #f))
+(define (jolt-note-throw-source! raw)
+  (let ((cur (jolt-throw-source)))
+    ;; a load's CompilerException wrapper keeps the position of the throw it
+    ;; wraps: the report asks for that throw's (jolt-load-wrap-origin)
+    (unless (or (and cur (eq? (car cur) raw))
+                (not (eq? (jolt-load-wrap-origin raw) raw)))
+      (jolt-throw-source (cons raw (jolt-current-source))))))
+;; The position `raw` was thrown at, as a pmap, or #f.
+(define (jolt-throw-source-position raw)
+  (let ((cur (jolt-throw-source)))
+    (and cur (eq? (car cur) raw) (cdr cur))))
+
+;; The diagnostic keys an analyzer error carries, or #f. Their presence marks
+;; a COMPILE-time diagnostic: raised while analyzing a form, so the live Chez stack
+;; is the analyzer recursing into it, never the user's program.
+(define diag-kw-err-kind (keyword "jolt.error" "kind"))
+(define diag-kw-err-line (keyword "jolt.error" "line"))
+(define diag-kw-err-column (keyword "jolt.error" "column"))
+(define diag-kw-err-file (keyword "jolt.error" "file"))
+;; A diagnostic is identified by CARRYING A KIND, not by having a wrapper map:
+;; the keys are flat and namespaced, so the test asks about the thing itself.
+(define (jolt-analyzer-diagnostic v)
+  (let ((data (and (jolt-ex-info-record? v) (jolt-ex-info-record-data v))))
+    (and (pmap? data)
+         (not (jolt-nil? (jolt-get data diag-kw-err-kind jolt-nil)))
+         data)))
+
+;; The location a report prints for FILE: where a classpath name was loaded from
+;; (rt.ss jolt-source-location), anything else as it is.
+(define (jolt-source-location-of file)
+  (if (string? file) (jolt-source-location file) file))
+
+;; "file:line:col" for a diagnostic that carries its own position, else #f — so a
+;; report can name the offending expression rather than the enclosing top-level
+;; form. Same shape jolt-source-position-string renders, so the two are
+;; indistinguishable in the report.
+(define (jolt-diagnostic-location-string err)
+  (let ((line (jolt-get err diag-kw-err-line jolt-nil))
+        (col (jolt-get err diag-kw-err-column jolt-nil))
+        (file (jolt-get err diag-kw-err-file jolt-nil)))
+    (and (not (jolt-nil? line))
+         (string-append
+           (if (jolt-nil? file) "" (string-append (jolt-str-render-one (jolt-source-location-of file)) ":"))
+           (number->string (jnum->exact line)) ":"
+           (if (jolt-nil? col) "?" (number->string (jnum->exact col)))))))
+
+;; Does this position map name a file?
+(define (jolt-position-names-file? p k)
+  (and (pmap? p) (not (jolt-nil? (jolt-get p k jolt-nil)))))
+
+;; "file:line:col" where the throwable `raw` happened, in the order a report
+;; should trust: the diagnostic's own position (the innermost form it failed in),
+;; the position the throw crossed a file load at, then whatever is evaluating now
+;; (a -e form, a build phase's file) — or #f. One answer for the uncaught reporter
+;; (cli-core.ss) and for a load the loader catches and warns about (a
+;; data_readers namespace).
+;;
+;; The diagnostic wins only when the two describe the SAME source. A diagnostic
+;; that names no file holds a position into some text; for a -e form or a REPL
+;; line that text is what the enclosing position describes as well, and line 3 of
+;; it beats the enclosing 1:1. But a (read-string "…") a running program makes is
+;; an unrelated string, and answering "1:5" for it in place of the file and line
+;; that called read-string names a position in nothing the reader can open.
+;; Enclosing-names-a-file while the diagnostic does not is exactly that case.
+(define (jolt-throwable-source-string raw)
+  (let* ((diag (jolt-analyzer-diagnostic (jolt-unwrap-throw raw)))
+         (encl (or (jolt-throw-source-position raw) (jolt-current-source))))
+    (or (and diag
+             (or (jolt-position-names-file? diag diag-kw-err-file)
+                 (not (jolt-position-names-file? encl hc-kw-file)))
+             (jolt-diagnostic-location-string diag))
+        (jolt-source-position-string (jolt-throw-source-position raw))
+        (jolt-current-source-string))))
+
+;; The spine ALWAYS runs with the full clojure.core prelude loaded, so a clojure.*
+;; ref must lower to var-deref (resolved from the prelude), not trip the emitter's
+;; "unsupported stdlib fn (no core on Chez yet)" out-of-subset guard — that guard
+;; is only for the bare -e subset with no prelude. Turn prelude mode on once, here,
+;; so every analyze->emit on this spine sees the full core.
+((var-deref "jolt.backend-scheme" "set-prelude-mode!") #t)
+;; Cache resolved var cells per reference site in runtime-compiled code (the big
+;; win for libraries / REPL code). emit-image.ss turns this back off so the seed
+;; mint and AOT build stay byte-deterministic. Guarded: the flag is absent in an
+;; older seed during the first re-mint pass.
+(let ((scv (var-deref "jolt.backend-scheme" "set-var-cache!")))
+  (when (procedure? scv) (scv #t)))
+;; Register each fn def's source, so an uncaught error's backtrace names frames
+;; "ns/name (file:line)" the way an AOT build's does instead of falling back to
+;; bare Chez procedure names. One hashtable insert per def at definition time, no
+;; per-call cost — unlike the tail-frame history (JOLT_TRACE), which pays a push
+;; per call and stays opt-in. emit-image.ss turns this back off for the seed mint,
+;; whose emitted prelude must not carry this machine's absolute paths.
+(let ((ssr (var-deref "jolt.backend-scheme" "set-source-reg!")))
+  (when (procedure? ssr) (ssr #t)))
+;; JOLT_TRACE is a falsey value (case-insensitive) — the single predicate both the
+;; dev-mode enable and the whole-run enable consult, so "off" never accidentally
+;; means "on". An empty / unset value is NOT falsey here — it carries no signal, so
+;; dev mode still traces and a whole run still doesn't.
+(define (jolt-trace-env-off? e)
+  (and (string? e)
+       (let ((s (string-downcase e)))
+         (or (string=? s "0") (string=? s "false") (string=? s "no")
+             (string=? s "off") (string=? s "n")))))
+;; Tail-frame history. Turning it on makes the emitter add a per-fn history push to
+;; every fn compiled AFTERWARD, and allocates this thread's ring. Suppressed when
+;; JOLT_TRACE is a falsey value, so JOLT_TRACE=0 / off / no disables it in dev mode.
+;; Off when JOLT_TRACE is a falsey value or --no-trace was given: the one test
+;; every enable and the build's emission switch (build.ss) go through, so the
+;; environment variable and the option cannot answer differently.
+(define jolt-trace-off-flag? #f)
+(define (jolt-trace-off?)
+  (or jolt-trace-off-flag? (jolt-trace-env-off? (getenv "JOLT_TRACE"))))
+;; --no-trace, set before the enable it suppresses: the launcher takes it ahead
+;; of jolt-trace-init!, and `jolt build` reads its own before it emits.
+(define (jolt-trace-set-off!) (set! jolt-trace-off-flag? #t))
+(def-var! "jolt.host" "set-trace-off!" (lambda () (jolt-trace-set-off!) jolt-nil))
+(define (jolt-enable-trace!)
+  (unless (jolt-trace-off?)
+    (let ((stf (var-deref "jolt.backend-scheme" "set-trace-frames!")))
+      (when (procedure? stf) (stf #t)))
+    (jolt-trace-enable!)))
+;; Exposed so the REPL / nREPL entrypoints (jolt.main, jolt.nrepl) can turn tracing
+;; on for REPL-driven development without the user setting JOLT_TRACE. Because the
+;; push is baked in at compile time, only code compiled after this call is traced —
+;; which is exactly the code you eval / reload in a live session.
+(def-var! "jolt.host" "enable-trace!" jolt-enable-trace!)
+;; Turn tracing on for a whole run, BEFORE any app namespace is compiled, so the
+;; app's own code carries the entry prologue. Called from the runtime entrypoints
+;; (cli.ss, and the built jolt launcher) — NOT at load time: a built jolt runs
+;; top-level forms at heap-build time, where JOLT_TRACE is always unset, so a
+;; load-time check would never see the user's runtime env.
+;;
+;; ON BY DEFAULT on this path — running from source is the develop-and-debug path,
+;; and without the history a tail call chain reports no location at all: TCO erases
+;; the frames, so the common shape (-main tail-calls a fn that throws) left the
+;; reporter with an empty continuation and nothing to name. Set JOLT_TRACE=0 to opt
+;; out. The cost is a per-entry ring push in code compiled at runtime; core is not
+;; affected (the seed prelude is already compiled), which is why a seq/string/map
+;; workload measures the same either way. It is only visible in code that is almost
+;; entirely user-level calls — a fib microbenchmark pays ~7x, which is the case to
+;; set JOLT_TRACE=0 for, or pass --no-trace as the first argument (`jolt
+;; --no-trace run …`), which this takes off ARGS before it decides. A `jolt build`
+;; binary is unaffected: its prologues are baked at build time, so this runtime
+;; switch cannot add them. Returns the arguments left to dispatch.
+(define (jolt-trace-init! args)
+  (let ((args (if (and (pair? args) (equal? (car args) "--no-trace"))
+                  (begin (jolt-trace-set-off!) (cdr args))
+                  args)))
+    (jolt-enable-trace!)
+    args))
+;; Host-side mirror of the emitter's trace-frames? flag: whether the emitted
+;; text carries #|L<line>|# markers (backend_scheme.clj with-site). When it is
+;; off, no markers exist, so the annotated read below would attach source
+;; objects with nothing to resolve them against — the eval path then takes
+;; exactly today's plain-read route. The SAME flag the emitter consults, so the
+;; two can never disagree about whether a form's text has markers. Resolved at
+;; load time (the image is resident), read at eval time (the flag flips at
+;; runtime via jolt-enable-trace! / emit-image).
+(define jolt-ce-trace-frames?-fn (var-deref "jolt.backend-scheme" "trace-frames?"))
+(define (jolt-ce-trace-frames?)
+  (and (procedure? jolt-ce-trace-frames?-fn) (jolt-ce-trace-frames?-fn)))
+
+;; Eval one emitted Scheme form WITH Chez source annotations, so a frame from
+;; this code carries a source object whose name is a registry key and whose
+;; offset is a byte position in `scm` — the pair a backtrace resolves to a clj
+;; line via jolt-eval-source-line. get-datum/annotations is what attaches the
+;; source object; make-source-file-descriptor needs a BINARY port, and
+;; get-datum/annotations a TEXTUAL one, so the text is opened twice over the
+;; same bytes. The registered marker table is all that survives this call — the
+;; text itself is transient. Tracing must be on (markers present) when called.
+;; The eval is the compile jolt.profile instruments (sa-profile-compile). FORM's
+;; own position goes with the table so a counter can name its file — never the
+;; sticky jolt-current-source, which for a form built at run time is whatever
+;; top-level form ran last — and WRITTEN, the form the user wrote (FORM, or the
+;; macro call it was unrolled from), to name its fn by.
+(define (jolt-eval-with-source scm form written ns)
+  (let* ((bv (string->utf8 scm))
+         (name (jolt-register-eval-marker-table! scm (hc-form-position form) written ns))
+         (sfd (make-source-file-descriptor name (open-bytevector-input-port bv)))
+         (ann (call-with-values
+               (lambda ()
+                 (get-datum/annotations
+                  (transcoded-port (open-bytevector-input-port bv) (native-transcoder))
+                  sfd 0))
+               (lambda (a p) a))))
+    (sa-profile-compile (lambda () (eval ann (interaction-environment))))))
+
+;; (with-meta sym m) -> sym, else x — an (ns ^:no-doc name …) yields the name with
+;; reader metadata as a with-meta form; strip it to read the bare ns symbol.
+(define (ce-unwrap-meta x)
+  (if (cseq? x)
+      (let ((items (seq->list x)))
+        (if (and (pair? items) (symbol-t? (car items))
+                 (string=? (symbol-t-name (car items)) "with-meta") (pair? (cdr items)))
+            (cadr items) x))
+      x))
+
+;; (quote X) -> X, else x — unwraps a quoted require spec.
+(define (ce-unquote x)
+  (if (cseq? x)
+      (let ((items (seq->list x)))
+        (if (and (pair? items) (symbol-t? (car items))
+                 (string=? (symbol-t-name (car items)) "quote") (pair? (cdr items)))
+            (cadr items) x))
+      x))
+
+;; A bare top-level (do ...) form — head is the unqualified `do` symbol.
+(define (ce-top-do? form)
+  (and (cseq? form)
+       (let ((h (seq-first form)))
+         (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
+              (string=? (symbol-t-name h) "do")))))
+
+;; Pre-register the :as/:refer a top-level (require ...)/(use ...)/(ns ...) form
+;; establishes under `ns`, for the walks that ANALYZE a namespace's forms without
+;; running them — the build's emit + inference walks and the seed mint — so a
+;; later form's s/foo resolves the way it does under the loader, where the
+;; require ran first. The runtime compile path has no use for it: there the form
+;; runs right after it compiles, and its require registers what it registers.
+;;
+;; Scoped to the compilation unit as Compiler.load delimits it: the top-level form
+;; itself and, through a top-level (do ...), its children — which the reference
+;; compiler evaluates one by one, so a do's require IS in force for the sibling
+;; after it. Nothing else is descended into. A require inside a fn or let body
+;; registers nothing until it runs, and then in whatever *ns* is current at the
+;; call; walking the whole form pre-registered it here in the DEFINING ns at
+;; compile time, so (defn r [] (require '[s :as z]) (z/f)) compiled where the
+;; JVM says "No such namespace: z", and — registered unchecked — a second
+;; (require '[other :as z]) overwrote the alias under the "Alias z already exists"
+;; check the runtime require then found satisfied.
+(define (ce-clause-require? cl)          ; (:require ...) / (:use ...) ns clause
+  (and (pair? cl) (keyword? (car cl))
+       (let ((kn (keyword-t-name (car cl)))) (or (string=? kn "require") (string=? kn "use")))))
+(define (ce-scan-requires! form ns)
+  (when (cseq? form)
+    (let ((items (seq->list form)))
+      (when (pair? items)
+        (let* ((h (car items)) (hn (and (symbol-t? h) (symbol-t-name h))))
+          (cond
+            ;; (require spec...) / (use spec...) — specs are quoted
+            ((and hn (or (string=? hn "require") (string=? hn "use")))
+             (for-each (lambda (a)
+                         (for-each (lambda (x) (chez-register-spec! ns x #f))
+                                   (expand-libspec (ce-unquote a))))
+                       (cdr items)))
+            ;; (ns name (:require [a :as x]) ...) — clause specs are literal. Register
+            ;; the aliases under NAME (the ns being defined), not the passed `ns`:
+            ;; when a file is loaded its ns form compiles while (chez-current-ns) is
+            ;; still the requiring ns, so using `ns` would leak the loaded ns's
+            ;; aliases into its requirer and clobber a same-named alias there
+            ;; (rewrite-clj.zip.base's [node.protocols :as node] over the caller's node).
+            ((and hn (string=? hn "ns"))
+             (let ((ns-name (if (and (pair? (cdr items)) (symbol-t? (ce-unwrap-meta (cadr items))))
+                                (symbol-t-name (ce-unwrap-meta (cadr items)))
+                                ns)))
+               (for-each (lambda (clause)
+                           (when (cseq? clause)
+                             (let ((cl (seq->list clause)))
+                               (when (ce-clause-require? cl)
+                                 (for-each (lambda (spec)
+                                             (for-each (lambda (x) (chez-register-spec! ns-name x #f))
+                                                       (expand-libspec spec)))
+                                           (cdr cl))))))
+                         (if (pair? (cdr items)) (cddr items) '()))))
+            ;; the compilation-unit rule: a top-level (do ...) is its children,
+            ;; each its own unit. Nothing else is descended into.
+            ((ce-top-do? form)
+             (for-each (lambda (x) (ce-scan-requires! x ns)) (cdr items)))))))))
+
+;; --- success-type lint (RFC 0006), opt-in via JOLT_CHECK --------------------
+;; A Carp-inspired surfacing of the existing success-type checker: with JOLT_CHECK
+;; set to a truthy value, every runtime-compiled top-level form is run through
+;; jolt.passes.types/check-form and any diagnostics are printed to stderr as
+;; located warnings (file:line:col: warning: …). Off by default: zero cost, no
+;; behavior change. A checker error is swallowed — linting must never break a
+;; compile. Only runtime-compiled code is linted; clojure.core and the prelude are
+;; baked into the seed at mint time, so they are never re-checked here.
+(define jolt-check-lint?
+  (let ((e (getenv "JOLT_CHECK")))
+    (and e (fx>? (string-length e) 0) (not (jolt-trace-env-off? e)))))
+(define jolt-check-form-fn #f)
+(define jolt-check-unit #f)
+(define (jolt-check-form node)
+  (unless jolt-check-form-fn
+    (set! jolt-check-form-fn (var-deref "jolt.passes.types" "check-form"))
+    (set! jolt-check-unit ((var-deref "jolt.passes.types" "new-unit"))))
+  ;; non-strict: only the always-safe core error domains, no user-fn signature
+  ;; probing (fewer false positives for a warning-level lint).
+  (jolt-check-form-fn jolt-check-unit node #f))
+
+;; "file:line:col" / "line:col" for a diagnostic's :pos map, the top-level form's
+;; position as a fallback, or #f when neither is known.
+(define (jolt-diag-loc-string pos)
+  (let ((p (if (pmap? pos) pos (jolt-current-source))))
+    (and (pmap? p)
+         (let ((line (jolt-get p hc-kw-line jolt-nil))
+               (col  (jolt-get p hc-kw-column jolt-nil))
+               (file (jolt-get p hc-kw-file jolt-nil)))
+           (string-append
+             (if (jolt-nil? file) "" (string-append (jolt-str-render-one (jolt-source-location-of file)) ":"))
+             (if (jolt-nil? line) "?" (number->string line)) ":"
+             (if (jolt-nil? col) "?" (number->string col)))))))
+
+(define diag-kw-pos (keyword #f "pos"))
+(define diag-kw-msg (keyword #f "msg"))
+(define (jolt-lint-node! node)
+  (when jolt-check-lint?
+    (guard (_ (#t #f))
+      (let ((diags (jolt-check-form node))
+            (port (current-error-port)))
+        (let loop ((s (jolt-seq diags)))
+          (unless (jolt-nil? s)
+            (let* ((d (seq-first s))
+                   (loc (jolt-diag-loc-string (jolt-get d diag-kw-pos jolt-nil)))
+                   (msg (jolt-get d diag-kw-msg jolt-nil)))
+              (when loc (display loc port) (display ": " port))
+              (display "warning: " port)
+              (unless (jolt-nil? msg) (display (jolt-str-render-one msg) port))
+              (newline port))
+            (loop (jolt-seq (seq-more s)))))))))
+
+;; Already-read FORM -> Scheme source string (analyze -> emit on Chez).
+;; `ns` is the compile namespace unqualified symbols resolve against. No require
+;; pre-scan here (ce-scan-requires! is for the walks that never run the form):
+;; the aliases in force are the ones earlier forms registered by RUNNING.
+(define (jolt-analyze-emit-form form ns)
+  (let* ((ctx (make-analyze-ctx ns))
+         ;; the form runs as soon as it compiles (hc-late-bound-namespace?)
+         (node (parameterize ((hc-compiling-to-run #t)) (jolt-ce-analyze ctx form))))
+    (jolt-lint-node! node)
+    (cond
+      ((hc-compiler-direct-linking?) (jolt-direct-link-emit node ctx))
+      ;; guarded inlining stashes and splices on the back end's unit, the one
+      ;; the inline pass reads (run-passes' invariant), as direct-linking does.
+      ;; Only untraced: a traced report names each fn from its own frame.
+      ((and hc-guarded-inline-on (not (jolt-ce-trace-frames?)))
+       (parameterize ((hc-form-guarded #t))
+         (jolt-ce-emit (jolt-ce-run-passes node ctx (jolt-ce-current-unit)))))
+      (else (jolt-ce-emit (jolt-ce-run-passes node ctx))))))
+
+;; A form compiled under (binding [*compiler-options* {:direct-linking true}] ...)
+;; gets what `jolt build` gives every app form: calls to the vars defined this
+;; way bind their jv$ binding, small fns splice into their callers, and record
+;; and protocol types are inferred (#1377). It is the JVM's direct-linking
+;; contract: a caller compiled now keeps the body it saw when the callee is
+;; redefined later, and ^:dynamic / ^:redef opt a var out. Off that binding the
+;; spine stays open-world, exactly as before.
+;;
+;; The 3-arg run-passes takes the unit the back end emits with, which is the
+;; unit the passes' inline/record-shape state must land on (run-passes'
+;; invariant). The runtime spine's unit lives for the process, so the set of
+;; direct-linked defs accumulates across forms the way a build's does across
+;; namespaces.
+(define jolt-ce-current-unit (var-deref "jolt.backend-scheme" "current-unit"))
+(define (jolt-direct-link-emit node ctx)
+  (parameterize ((hc-form-direct-link #t))
+    (jolt-ce-emit (jolt-ce-run-passes node ctx (jolt-ce-current-unit)))))
+
+;; --- runtime defmacro -------------------------------------------------------
+;; Shared with emit-image.ss (loaded after this). A defmacro lowers to a def of
+;; its expander fn + a macro flag, exactly as the prelude emits build-time macros.
+
+;; Is `f` a (defmacro ...) / (definline ...) form?
+(define (ce-macro-form? f)
+  (and (cseq? f)
+       (let ((items (seq->list f)))
+         (and (pair? items) (symbol-t? (car items))
+              (let ((h (symbol-t-name (car items))))
+                (or (string=? h "defmacro") (string=? h "definline")))))))
+
+;; --- derived defmacro var metadata ------------------------------------------
+;; The runtime spine gets a defmacro's :doc/:arglists for free (the analyzer's
+;; defmacro arm derives them); this static mirror is for the image/build path,
+;; which lowers the form via ce-defmacro->fn instead and used to drop the meta
+;; entirely — every image-baked macro's (meta #'when) came back {:ns :name}.
+;; Merge order matches the analyzer arm (and the JVM, where a defmacro IS a defn):
+;; name ^meta < derived :arglists < docstring < leading attr-map < trailing one.
+(define ce-kw-arglists (keyword #f "arglists"))
+(define ce-kw-doc (keyword #f "doc"))
+
+;; (quote x) -> x, else #f. The runtime path EVALUATES attr values, so a quoted
+;; value must land as its datum, not as the (quote …) form.
+(define (ce-quoted-datum v)
+  (and (cseq? v)
+       (let ((h (seq-first v)))
+         (and (symbol-t? h) (jolt-nil? (hc-sym-ns h))
+              (string=? (symbol-t-name h) "quote")))
+       (let ((r (seq->list v)))
+         (and (pair? r) (pair? (cdr r)) (cadr r)))))
+
+;; A value the image can carry as quoted data with the same meaning the runtime
+;; path's evaluation gives it: self-evaluating literals and vectors thereof. A
+;; symbol or a call would evaluate to something else, so those entries are
+;; skipped — they were dropped wholesale before, a skip is never a regression.
+(define (ce-static-datum? v)
+  (cond ((or (string? v) (number? v) (boolean? v) (char? v) (keyword-t? v)) #t)
+        ((jolt-nil? v) #t)
+        ((pvec? v)
+         (let ((n (jolt-count v)))
+           (let loop ((i 0))
+             (or (= i n)
+                 (and (ce-static-datum? (jolt-nth v i)) (loop (+ i 1)))))))
+        (else #f)))
+
+;; Fold an attr/name-meta pmap onto base, keeping only statically-safe values.
+(define (ce-attr-onto base m)
+  (pmap-fold m
+    (lambda (k v acc)
+      (let ((q (ce-quoted-datum v)))
+        (cond (q (jolt-assoc acc k q))
+              ((ce-static-datum? v) (jolt-assoc acc k v))
+              (else acc))))
+    base))
+
+;; params-or-clauses -> jolt list of the param vectors as written, or #f.
+(define (ce-derive-arglists after-meta)
+  (cond ((null? after-meta) #f)
+        ((cseq? (car after-meta))          ; multi-arity ([p] body…) clauses
+         (apply jolt-list (map seq-first after-meta)))
+        ((pvec? (car after-meta)) (jolt-list (car after-meta)))
+        (else #f)))
+
+;; The var meta pmap for a defmacro form's pieces, or #f when there is nothing.
+(define (ce-defmacro-meta name-sym after-meta attr doc trail)
+  (let* ((arglists (ce-derive-arglists after-meta))
+         (nm-meta (hc-sym-meta name-sym))
+         (m (jolt-hash-map))
+         (m (if (pmap? nm-meta) (ce-attr-onto m nm-meta) m))
+         (m (if arglists (jolt-assoc m ce-kw-arglists arglists) m))
+         (m (if doc (jolt-assoc m ce-kw-doc doc) m))
+         (m (if (pmap? attr) (ce-attr-onto m attr) m))
+         (m (if (pmap? trail) (ce-attr-onto m trail) m)))
+    (and (> (jolt-count m) 0) m)))
+
+;; (defmacro NAME [docstring] [attr-map] params body...)
+;; -> (values "NAME" (fn ...) meta-pmap-or-#f).
+;; Strips a leading docstring (native string) + attr-map (a non-symbol pmap), then
+;; re-heads the rest with `fn` so a destructured macro arglist desugars. Emits the
+;; BARE fn (the caller wraps it in def-var! + mark-macro!), never a (def NAME ...) —
+;; interning NAME would make require skip the real macro. The head is the QUALIFIED
+;; clojure.core/fn, not a bare `fn`, so it resolves to the real fn macro even when
+;; the macro being defined IS `fn` (schema's s/fn) or the ns excluded it.
+;; The same [&form &env & declared] prefix the analyzer's defmacro arm applies
+;; (analyzer.clj macro-fn-arities) — this is the build/image path's lowering of
+;; the same form, so the two must agree or an image-baked macro would answer a
+;; different calling convention than a runtime-defined one.
+(define ce-amp-form-sym (jolt-symbol #f "&form"))
+(define ce-amp-env-sym (jolt-symbol #f "&env"))
+(define (ce-macro-params pvec)
+  (let* ((m (jolt-meta pvec))
+         (items (let ((s (jolt-seq pvec))) (if (jolt-nil? s) '() (seq->list s))))
+         (v (apply jolt-vector (cons ce-amp-form-sym (cons ce-amp-env-sym items)))))
+    (if (jolt-nil? m) v (jolt-with-meta v m))))
+(define (ce-macro-arities after)
+  (cond ((null? after) after)                               ; (defmacro m) declares none
+        ((pvec? (car after))                                 ; a lone (params body …)
+         ;; normalized into ONE clause, as the reference does before it prepends
+         ;; anything, so the shape matches analyzer.clj macro-fn-arities exactly.
+         (list (apply jolt-list (cons (ce-macro-params (car after)) (cdr after)))))
+        (else
+         (map (lambda (clause)                               ; ((params body …) …)
+                (let ((es (seq->list clause)))
+                  (apply jolt-list (cons (ce-macro-params (car es)) (cdr es)))))
+              after))))
+;; The forms after the docstring and leading attr-map, split into
+;; [arity-forms . trailing-attr-map]. defmacro takes a trailing attr-map exactly
+;; as defn does; running it through the arity lowering made it a bogus
+;; ([&form &env]) clause. Only a MULTI-arity body can carry one — a single
+;; `[params] body` is one clause already, so its last form is a map-returning
+;; body. Matches analyzer.clj macro-trail-attr, which is the runtime path's
+;; spelling of this same split.
+(define (ce-macro-trail-attr after)
+  (if (and (pair? after) (not (pvec? (car after))) (pair? (cdr after)))
+      (let loop ((xs after) (acc '()))
+        (if (null? (cdr xs))
+            (if (pmap? (car xs)) (cons (reverse acc) (car xs)) (cons after #f))
+            (loop (cdr xs) (cons (car xs) acc))))
+      (cons after #f)))
+
+(define (ce-defmacro->fn f)
+  (let* ((items (seq->list f))
+         (name-sym (cadr items))
+         (after-name (cddr items))
+         (doc (and (pair? after-name) (string? (car after-name)) (car after-name)))
+         (a1 (if doc (cdr after-name) after-name))
+         (attr (and (pair? a1) (pmap? (car a1)) (car a1)))
+         (a2 (if attr (cdr a1) a1))
+         (split (ce-macro-trail-attr a2))
+         (after-meta (car split))
+         (trail (cdr split))
+         (fn-sym (jolt-symbol "clojure.core" "fn")))
+    (values (symbol-t-name name-sym)
+            (apply jolt-list (cons fn-sym (ce-macro-arities after-meta)))
+            (ce-with-form-position (ce-defmacro-meta name-sym after-meta attr doc trail) f))))
+
+;; The form's reader position (:line/:column, and :file when compiling a file)
+;; merged last, as the analyzer's stamp-def-pos does for a runtime defmacro and
+;; the JVM Compiler does for every def: position beats an attr-map's :line.
+(define (ce-with-form-position m f)
+  (let ((p (hc-form-position f)))
+    (if (jolt-nil? p)
+        m
+        (pmap-fold p (lambda (k v acc) (jolt-assoc acc k v)) (or m (jolt-hash-map))))))
+
+;; Clojure's compilation-unit rule applies to a top-level MACRO CALL too: the
+;; form is macroexpanded first, and when the expansion lands on (do ...) its
+;; children are compiled+evaluated as their own top-level forms — that is how a
+;; macro can emit (do (require …) (deftest …)) with the require in force before
+;; the deftest compiles. The expansion here is a PROBE: a non-do expansion is
+;; discarded and the ORIGINAL form goes to the analyzer unchanged (its macro
+;; arm re-expands, keeping def position stamping and the rest of that path), so
+;; only forms that really unroll take this route. Special-form heads never
+;; expand, mirroring analyze-list's precedence; an expander that throws is the
+;; analyzer's to report, with its source position.
+(define (ce-expand-to-top-do form ns)
+  (let ((ctx (make-analyze-ctx ns)))
+    (let loop ((f form) (n 0))
+      (cond
+        ((> n 100) #f)                    ; runaway expansion; leave it to the analyzer
+        ((ce-top-do? f) f)
+        ((and (cseq? f)
+              (let ((h (seq-first f)))
+                (and (symbol-t? h)
+                     (not (hc-special? (symbol-t-name h)))
+                     (hc-macro? ctx h))))
+         (loop (guard (e (#t #f)) (hc-expand-1 ctx f)) (+ n 1)))
+        (else #f)))))
+
+;; Compile + eval ONE already-read form in ns `ns`; returns the value.
+;;
+;; `ns` is the form's namespace for BOTH halves of the job: unqualified symbols
+;; are analyzed against it, and the runtime current ns is pointed at it too, so
+;; *ns*, resolve, macroexpand, and anything a macro reads through them agree with
+;; the ns the form compiled in. They used to be able to disagree — the analyzer
+;; took `ns` and the runtime kept whatever the last load left behind — which made
+;; a runtime (defmacro …) intern into `ns` and then be invisible to the very
+;; resolve/macroexpand that would have to find it.
+;;
+;; The switch is NOT restored on the way out. That is deliberate and it is what
+;; makes an (ns …) work: a form is allowed to move the current ns and have the
+;; move outlive it, which is how the loader threads one file's ns through the
+;; rest of that file, and how (eval '(in-ns 'foo)) lands you in foo. A caller
+;; that wants the ambient ns back saves and restores around the call, the way
+;; Clojure's load binds *ns* to itself — ldr-require-ns does, per file. The build
+;; walks (build.ss, emit-image.ss ei-for-each-form) set the ns themselves before
+;; walking a namespace's forms and want it to stay set, so for them this is a
+;; write of the value that is already there.
+;;
+;; A top-level (do ...) is UNROLLED — each subform compiled+eval'd in turn, like
+;; Clojure's top-level do — so a runtime defmacro/def in an earlier subform is
+;; visible (macro flag set, var interned) before a later subform is analyzed.
+;; Only lists, symbols, and the persistent collections may carry code the
+;; analyzer must compile; every other value — numbers, strings, keywords, and
+;; opaque host objects (a #inst Date, a #uuid, a regex, a record, a function) —
+;; evaluates to itself, as eval does on the JVM. (read-string builds those host
+;; values eagerly, so eval must accept them without trying to analyze them.)
+;; OUTER is the form the user wrote that FORM was unrolled from, a macro call
+;; whose (do ...) expansion it is a child of, or #f. jolt.profile names a form's
+;; code after it: a defrecord's methods are in its children.
+(define (jolt-compile-eval-form form ns) (jolt-compile-eval-form/outer form ns #f))
+(define (jolt-compile-eval-form/outer form ns outer)
+  (if (or (cseq? form) (jolt-lazyseq? form) (empty-list-t? form) (symbol-t? form)
+          (pvec? form) (pmap? form) (pset? form))
+      (jolt-compile-eval-form* form ns outer)
+      form))
+(define (jolt-compile-eval-form* form ns outer)
+  ;; Written with set-chez-ns! and guarded by a difference test, so this is
+  ;; exactly what an (in-ns …) in the form itself would do — including the one
+  ;; case where it does nothing: under a (binding [*ns* …]) the current ns
+  ;; DERIVES from that binding (multimethods.ss chez-current-ns), the caller
+  ;; passed it as `ns` in the first place, and the test is already false.
+  (unless (string=? ns (chez-current-ns)) (set-chez-ns! ns))
+  (cond
+    ;; thread the current ns: an earlier subform may switch it (ns/in-ns call
+    ;; set-chez-ns!), and the next subform must be ANALYZED in that ns so its defs
+    ;; land there and its refs resolve (cross-ns def/require in one program).
+    ((ce-top-do? form)
+     (let loop ((fs (cdr (seq->list form))) (result jolt-nil) (cur ns))
+       (if (null? fs)
+           result
+           (let ((r (jolt-compile-eval-form/outer (hc-propagate-pos form (car fs)) cur outer)))
+             (loop (cdr fs) r (chez-current-ns))))))
+    ;; a macro call whose expansion is a (do ...): unroll the expansion the same
+    ;; way (each child re-enters, so nested macro-to-do chains unroll too). The
+    ;; children are macro-built and carry no reader position, so each list child
+    ;; without one inherits the call form's — an error in a child (an ns form's
+    ;; failing :require, say) must still point at the form in the source file.
+    ((ce-expand-to-top-do form ns)
+     => (lambda (expansion)
+          (jolt-compile-eval-form/outer
+            (apply jolt-list
+                   (cons (seq-first expansion)
+                         (map (lambda (c) (hc-propagate-pos form c))
+                              (cdr (seq->list expansion)))))
+            ns (or outer form))))
+    ;; defmacro is compiled like any other form — the analyzer lowers it to a def
+    ;; of the expander fn + (mark-macro! …) so subsequent forms expand it. One
+    ;; macro-expansion path (no separate spine interception).
+    (else
+     ;; record this form's source location first, so a compile- or run-time error
+     ;; in it reports the right place.
+     (jolt-enter-form! form)
+     (let* ((scm (jolt-analyze-emit-form form ns))
+            (cap (jolt-aot-capture)))            ; tee for the AOT cache (loader.ss)
+       (when cap (put-string cap scm) (newline cap))
+       ;; the run is a root as much as the compile was: expanding the form ran
+       ;; macros, whose tail sites would otherwise be what a throw here reports.
+       (jolt-site-reset!)
+       ;; The run is replayed as itself: a cached load runs SCM, so whatever SCM
+       ;; does when it runs — an (eval '(def keys 1)) in the ns body, a
+       ;; load-string — happens again there on its own. Capture is off for the
+       ;; run, so that work is not ALSO teed in after this form (twice on a warm
+       ;; load: the def ran twice and a refer-replacement warning printed
+       ;; twice). An eval a macro does while this form is ANALYZED stays
+       ;; captured: SCM does not repeat it.
+       (let ((run (lambda ()
+                    (if (jolt-ce-trace-frames?)
+                        (jolt-eval-with-source scm form (or outer form) ns)
+                        (eval (read (open-input-string scm)) (interaction-environment))))))
+         (if cap
+             (parameterize ((jolt-aot-capture #f)) (run))
+             (run)))))))
+
+;; Source string -> value (read one form, compile + eval on Chez, in the
+;; top-level environment where rt.ss's runtime procedures live).
+(define (jolt-compile-eval src ns)
+  (jolt-compile-eval-form (jolt-ce-read src) ns))
+
+;; clojure.core/load-string: read every form from the source string and compile+
+;; eval each in the current ns, returning the last value (nil for blank input).
+;; Reads RAW forms (like loading a file) so reader literals — #inst/#uuid/#"regex"
+;; and user #tag readers — stay as forms the analyzer compiles, rather than being
+;; built into opaque values the way read-string does. `data-readers-active` and
+;; `ldr-apply-readers` come from the loader, present in the CLI runtime; guard the
+;; read so load-string still works in a bootstrap/build context without it.
+;; Establishes default thread bindings for JVM-compiler vars so vendored code
+;; that (set! *warn-on-reflection* …) at the file level finds a thread-local slot.
+;;
+;; The string is not the file that called load-string. The loader binds the
+;; reader's file around a whole file load, and reading under it tagged the
+;; string's forms with the CALLER's path: a diagnostic at the string's line 2
+;; rendered against line 2 of the calling script, with a snippet of it, and
+;; *file* inside the string answered the script. So the reader's file is off
+;; here, as read-string's is (reader.ss jolt-read-form-raw), and *file* /
+;; *source-path* are what the reference's Compiler.load binds for a reader with
+;; no path: nil and "NO_SOURCE_FILE". Only the FILE goes: load-string is source,
+;; and a read error in it keeps the :read-source phase a read-string's lacks.
+;;
+;; A tool that evaluates text it knows the file of (an editor's buffer, an nREPL
+;; load-file with its file-path) passes that path as the second argument, as
+;; Compiler.load takes a source path: the forms then carry it as :file, as a
+;; file load's do (the position a def records, the trace, jolt.profile's
+;; counts), and *file* / *source-path* are the path and its name. A third
+;; argument is that name, as Compiler.load's sourceName (nREPL's load-file sends
+;; it as file-name): *source-path* is exactly it, nil included. Without one the
+;; name is the path's last segment, as a file load's is.
+;; --- Compiler.load's CompilerException (rt.ss jolt-load-wrap) ---------------
+;; What a top-level form's run throws leaves the load as a CompilerException:
+;; "Syntax error macroexpanding at ([source:]line:col).", ex-data
+;; {:clojure.error/phase :execution, :line, :column[, :source]}, the throw as
+;; its cause. The position is the reader's before the form, past whitespace and
+;; commas but not comments (Compiler.load's consumeWhitespaces then
+;; LINE_BEFORE). A compile diagnostic (it carries :clojure.error/phase) and a
+;; CompilerException a nested load raised go through as they are.
+(define ce-kw-ref-phase (keyword "clojure.error" "phase"))
+(define ce-kw-ref-line (keyword "clojure.error" "line"))
+(define ce-kw-ref-column (keyword "clojure.error" "column"))
+(define ce-kw-ref-source (keyword "clojure.error" "source"))
+(define ce-kw-execution (keyword #f "execution"))
+(define ce-compiler-exception "clojure.lang.Compiler$CompilerException")
+;; Reader position bookkeeping, incremental so a load stays linear: the
+;; (line . col) at offset TO, given LINE/COL at FROM. \r\n and a lone \r end a
+;; line, as LineNumberingPushbackReader counts them.
+(define (ce-skip-ws s i end)
+  (if (and (fx<? i end)
+           (let ((c (string-ref s i))) (or (char-whitespace? c) (char=? c #\,))))
+      (ce-skip-ws s (fx+ i 1) end)
+      i))
+(define (ce-advance s from to line col)
+  (let loop ((i from) (line line) (col col))
+    (if (fx>=? i to)
+        (cons line col)
+        (let ((c (string-ref s i)))
+          (cond ((char=? c #\newline) (loop (fx+ i 1) (fx+ line 1) 1))
+                ((char=? c #\return)
+                 (if (and (fx<? (fx+ i 1) to) (char=? (string-ref s (fx+ i 1)) #\newline))
+                     (loop (fx+ i 2) (fx+ line 1) 1)
+                     (loop (fx+ i 1) (fx+ line 1) 1)))
+                (else (loop (fx+ i 1) line (fx+ col 1))))))))
+(define (ce-wraps? raw)
+  (and (or (jolt-throw-condition? raw) (serious-condition? raw))
+       (let ((v (jolt-unwrap-throw raw)))
+         (not (and (jolt-ex-info-record? v)
+                   (or (equal? (jolt-ex-info-record-class-name v) ce-compiler-exception)
+                       (let ((d (jolt-ex-info-record-data v)))
+                         (and (pmap? d)
+                              (not (jolt-nil? (jolt-get d ce-kw-ref-phase jolt-nil)))))))))))
+(define (ce-load-exception raw source line col)
+  (let* ((v (jolt-unwrap-throw raw))
+         (msg (string-append "Syntax error macroexpanding at ("
+                             (if source (string-append source ":") "")
+                             (number->string line) ":" (number->string col) ")."))
+         (data (let ((m (jolt-hash-map ce-kw-ref-phase ce-kw-execution
+                                       ce-kw-ref-line line ce-kw-ref-column col)))
+                 (if source (jolt-assoc m ce-kw-ref-source source) m)))
+         (t (jolt-capture-throwable! (make-jolt-ex-info-record ce-compiler-exception msg v data 0))))
+    (jolt-with-mutex jolt-load-wrap-mutex
+      (hashtable-set! jolt-load-wrap-origins t raw))
+    t))
+;; Run one top-level form of a load W (#f, or the #(source) jolt-load-wrap held
+;; when the load started) read at POS (line . col).
+(define (jolt-load-run-form w pos thunk)
+  (if (not w)
+      (thunk)
+      ;; A handler, not a guard: it decides at the raise, before anything
+      ;; unwinds. A guard whose clause declines re-raises by re-entering the
+      ;; body's continuation, and a namespace load refuses to be re-entered (a
+      ;; nested require's CompilerException came back as "Re-entered the load").
+      ;; The wrapper is raised from the handler, so the stack unwinds once, past
+      ;; the whole load, to whoever catches it. This handler is nearer than the
+      ;; loader's, which records where a throw happened, so it records the
+      ;; original here, where jolt-current-source is still this form's; the
+      ;; loader's skips the wrapper.
+      (with-exception-handler
+        (lambda (raw)
+          (if (ce-wraps? raw)
+              (begin
+                (jolt-note-throw-source! raw)
+                (jolt-raise-thrown
+                  (ce-load-exception raw (let ((s (vector-ref w 0))) (and (string? s) s))
+                                     (car pos) (cdr pos))))
+              (raise-continuable raw)))
+        thunk)))
+
+(define ls-file-cells #f)
+(define (ls-file-name path)
+  (let loop ((i (- (string-length path) 1)))
+    (cond ((< i 0) path)
+          ((char=? (string-ref path i) #\/) (substring path (+ i 1) (string-length path)))
+          (else (loop (- i 1))))))
+(define (jolt-eval-string s . source)
+  (let ((end (string-length s))
+        (path (and (pair? source) (string? (car source)) (car source)))
+        (named? (and (pair? source) (pair? (cdr source))))
+        ;; a load-string's Compiler.load wrap, for this load's own forms only
+        (w (jolt-load-wrap))
+        ;; a diagnostic's snippet in it reads this text, not the file on disk
+        (noted (when (and (pair? source) (string? (car source)))
+             (jolt-eval-source-text-set! (car source) s)))
+        (drl (guard (_ (#t #f)) data-readers-active)))
+    ;; Resolved once the vars exist (a bootstrap context may run this first),
+    ;; the way ldr-with-file-vars resolves the loader's; until then no frame.
+    (unless ls-file-cells
+      (let ((f (var-cell-lookup "clojure.core" "*file*"))
+            (sp (var-cell-lookup "clojure.core" "*source-path*")))
+        (when (and f sp)
+          (set! ls-file-cells (list (cons f jolt-nil) (cons sp "NO_SOURCE_FILE"))))))
+    ;; The same frame ldr-with-file-vars gives a file and the loader gives a
+    ;; compiled namespace, from the one definition of which vars that is — this
+    ;; site listed two of the three by hand, so a (set! *unchecked-math* true)
+    ;; inside a load-string escaped into the caller and changed what its later
+    ;; arithmetic compiled to. It scopes through jolt-with-ns-load-vars rather
+    ;; than a hand-rolled (dynamic-wind push! body pop!): a throw mid-load must
+    ;; still unwind the frame, and so must a PARK — dyn-binding.ss documents why
+    ;; the winder shape pushes a second frame when a fiber resumes inside it.
+    (jolt-with-ns-load-vars
+      (lambda ()
+        (dyn-with-frame (cond ((not ls-file-cells) '())
+                              (path (list (cons (car (car ls-file-cells)) path)
+                                          (cons (car (cadr ls-file-cells))
+                                                (if named? (cadr source) (ls-file-name path)))))
+                              (else ls-file-cells))
+          (lambda ()
+            (parameterize ((rdr-source-file path) (jolt-load-wrap #f))
+              ;; rdr-read-top, not rdr-read-form: a stray close delimiter is
+              ;; "Unmatched delimiter", raised when the read reaches it, after the
+              ;; forms before it have run (Compiler.load). rdr-read-form hands it
+              ;; back unconsumed, and the loop took that for the end of input.
+              ;; pos is the reader's (line . col) at i, kept only for a wrap.
+              (let loop ((i 0) (result jolt-nil) (pos '(1 . 1)))
+                (if (>= i end)
+                    result
+                    (let* ((k (if w (ce-skip-ws s i end) i))
+                           (pos (if w (ce-advance s i k (car pos) (cdr pos)) pos)))
+                      (let-values (((form j) (rdr-read-top s k end)))
+                        (if (> j k)
+                            (loop j
+                                  (if (rdr-eof? form)
+                                      result
+                                      ;; data readers run at the read, outside the wrap
+                                      (let ((form (if drl (ldr-apply-readers form) form)))
+                                        (jolt-load-run-form w pos
+                                          (lambda ()
+                                            (jolt-compile-eval-form form (chez-current-ns))))))
+                                  (if w (ce-advance s k j (car pos) (cdr pos)) pos))
+                            result))))))))))))
+
+;; eval / load-string are FUNCTIONS on the spine (the compiler image is resident
+;; at runtime). eval takes an already-read FORM (e.g. from quote / list); it and
+;; load-string compile+eval in the current ns. eval is removed from the analyzer's
+;; special-symbol lists (host-contract.ss) so it resolves as an ordinary core var.
+;;
+;; A form with no position of its own (built by code, or read by read-string,
+;; which stamps none) compiles at the position of the form being evaluated
+;; around it, as the reference's Compiler takes LINE/COLUMN from the enclosing
+;; load for any expression without :line metadata: its fns' frames, an `is` in
+;; it and a def it makes name that line. A form that has one compiles at its
+;; own, and the enclosing position is back once the eval returns, as the
+;; reference's binding of LINE is popped.
+(define (ce-eval-at-enclosing form)
+  (let ((line (jolt-atom-val compiler-line-cell))
+        (col (jolt-atom-val compiler-column-cell)))
+    (if (and (cseq? form) (fixnum? line) (fx>? line 0)
+             (jolt-nil? (hc-form-line form)))
+        (let ((m (jolt-meta form)))
+          (jolt-with-meta form
+            (let ((m (if (pmap? m) m (jolt-hash-map))))
+              (jolt-assoc (jolt-assoc m hc-kw-line line) hc-kw-column col))))
+        form)))
+(def-var! "clojure.core" "eval"
+  (lambda (form)
+    (let ((line (jolt-atom-val compiler-line-cell))
+          (col (jolt-atom-val compiler-column-cell)))
+      (dynamic-wind
+        void
+        (lambda () (jolt-compile-eval-form (ce-eval-at-enclosing form) (chez-current-ns)))
+        (lambda ()
+          (jolt-atom-val-set! compiler-line-cell line)
+          (jolt-atom-val-set! compiler-column-cell col))))))
+;; load-string is Compiler.load over a string: *ns* is bound for the load, so
+;; an (ns …) in the string does not leave the caller in that namespace. A REPL
+;; is the one place that wants the switch to stick, and it gets it the way
+;; clojure.main and nREPL do: it binds *ns* once for the session and evaluates
+;; each entry with jolt.host/eval-string, the same loop without the binding,
+;; reading *ns* afterwards.
+(define (jolt-load-string s . source)
+  (jolt-with-ns-bound
+    (lambda ()
+      (parameterize ((jolt-load-wrap (vector (and (pair? source) (string? (car source)) (car source)))))
+        (apply jolt-eval-string s source)))))
+;; clojure.core's takes the string alone, as the reference's does; jolt.host's
+;; two take an optional source path (jolt-eval-string above)
+(def-var! "clojure.core" "load-string" (lambda (s) (jolt-load-string s)))
+(def-var! "jolt.host" "load-string" jolt-load-string)
+(def-var! "jolt.host" "eval-string" jolt-eval-string)
+;; load-reader: read the reader to its end and load that, as load-string does.
+(def-var! "clojure.core" "load-reader"
+  (lambda (rdr) (jolt-load-string ((var-deref "clojure.core" "slurp") rdr))))
+
+;; --- jolt.scheme: the Scheme escape hatch (epic jolt-of08.6) ------------------
+;; stdlib/jolt/scheme.clj is a thin veneer over these two. The contract is RAW:
+;; nothing is marshaled in either direction — numbers, strings, booleans and
+;; chars are shared representations anyway; everything else crosses as whatever
+;; it is on the other side, and the docs say so. Host-specific by design.
+;;
+;; scheme-proc, the other half of jolt.scheme, is a top-level lookup that needs
+;; no compiler and lives in host-contract.ss, so a compiler-dropped binary
+;; still answers it; this file is left out of such a binary (build.ss
+;; bld-emit-runtime), and scheme-eval-string is a dce-compile-ref for it.
+;; scheme-eval-string reads SCHEME text with the Scheme reader (not jolt's) and
+;; evaluates every form, returning the last value; definitions persist in the
+;; interaction environment, where the runtime itself lives.
+(def-var! "jolt.host" "scheme-eval-string"
+  (lambda (s)
+    (let ((p (open-input-string (jolt-need-string s))))
+      (let loop ((last jolt-nil))
+        (let ((form (read p)))
+          (if (eof-object? form)
+              last
+              (loop (eval form))))))))

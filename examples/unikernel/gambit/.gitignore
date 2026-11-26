@@ -7,3 +7,6 @@ kernel-probe_.c
 serve.c
 serve_.c
 booter
+# generated C in the vendored boot tree (boot-probe.c ~111MB)
+jolt-lang/host/gambit/*.c
+jolt-lang/host/gambit/*_.c

@@ -1,0 +1,552 @@
+;; host class tokens — a bare class name (String, Keyword, File...)
+;; evaluates to its JVM canonical-name STRING, the same value (class instance)
+;; returns, so (= String (class "x")) holds and a (defmethod m String ...) keys
+;; against a (class …) dispatch (ring.util.request does this).
+;; The analyzer resolves these names to clojure.core vars, so the back end emits
+;; (var-deref "clojure.core" "String") — def-var!'ing the canonical strings here is
+;; all that's needed at runtime.
+;;
+;; Loaded after natives-meta.ss (jolt-type) + the printer (jolt-str-render-one).
+
+;; (class x) — Clojure's class of a value. Scalars map to their JVM class name,
+;; matching core-class. Collections/seqs have no JVM class on this host;
+;; (str (type x)) is the clean host taxonomy and
+;; is never compared against a class token in the corpus. Records yield their
+;; ns-qualified class name (= (str (type x))). Total — never crashes.
+;; A host shim (bigdec, queue, host-table) registers its type's class name via
+;; register-class-arm! instead of set!-wrapping jolt-class (cf. register-hash-arm!).
+;; The entry is stable, so the var cell bound below stays current as arms register.
+(define jolt-class-arms '())
+;; the last class name the arm walk answered (jolt-class-name, below); a new arm
+;; may change an answer, so it clears
+(define jolt-class-name-last (cons #f #f))
+(define (register-class-arm! pred handler)
+  (set! instance-arms-epoch (fx+ instance-arms-epoch 1))
+  (set! jolt-class-name-last (cons #f #f))
+  (set! jolt-class-arms (cons (cons pred handler) jolt-class-arms)))
+;; A LIBRARY's arm (__register-class!) is probed as it registers: it arrives at
+;; runtime, after the whole runtime has loaded, so its predicate can be run
+;; against the probes there and then. The runtime's own arms cannot be probed at
+;; registration — one of them names a predicate from a file that loads later, and
+;; an unbound reference aborts the whole-program release build instead of
+;; raising — so class-arms-claiming-fast-types answers for them after boot, and
+;; the dispatch-caches unit gate requires it to be empty.
+(define (register-class-arm-checked! pred handler)
+  (class-arm-reject-fast-type! '__register-class! pred)
+  (class-arm-live! pred)
+  (register-class-arm! pred handler))
+;; The arms of the walk that can claim x, in walk order: the whole list here; a
+;; host narrows it per type (host-static.ss on Chez), as it does the print arms.
+;; An arm whose predicate reads more than the type -- a library's, which the
+;; runtime cannot vouch for, or one that looks into the value's state -- is
+;; marked live and stays in every narrowed walk.
+(define class-arms-for (lambda (arms x) arms))
+(define (set-class-arms-for! f) (set! class-arms-for f))
+(define class-arm-live-preds '())
+(define (class-arm-live! pred) (set! class-arm-live-preds (cons pred class-arm-live-preds)))
+(define (class-arms-claiming-fast-types)
+  (let ((probes (class-fast-probes)))
+    (filter (lambda (arm)
+              (exists (lambda (p) (guard (e (#t #f)) (and ((car arm) p) #t))) probes))
+            jolt-class-arms)))
+
+;; The runtime's own values answer (class x) without the arm walk: scalars, jolt's
+;; collections and seqs, records and plain reifies. The walk is ~50 predicates
+;; long and grows as libraries load, and (class x) is not the only thing that
+;; pays it — instance? asks it of every value it cannot answer otherwise, so a
+;; miss on a number cost two thirds of a microsecond.
+;;
+;; A record's class is its tag, and only its tag: the else arm of
+;; jolt-class-base rendered jolt-type, which honours :type METADATA, so
+;; (class (with-meta a-record {:type :foo})) answered :foo where the JVM answers
+;; the record's class. A plain reify reports the fixed stand-in the JVM's
+;; per-site ns$reify__N cannot be reproduced by (this used to be an arm in
+;; vars.ss); a proxy is a reify with a delegate and keeps its arm (proxy.ss).
+;;
+;; Sound only while no arm claims one of these types: __register-class! refuses
+;; one that does (register-class-arm-checked!), which also covers its
+;; value-host-tags half since that reuses the predicate, and the runtime's own
+;; arms are held to it by class-arms-claiming-fast-types below.
+(define (class-fast-name x)
+  (cond ((or (jolt-nil? x) (boolean? x) (number? x) (string? x) (keyword? x)
+             (symbol-t? x) (char? x) (pvec? x) (pmap? x) (pset? x) (cseq? x)
+             (empty-list-t? x) (jolt-lazyseq? x))
+         (jolt-class-base x))
+        ((jrec? x) (jrec-tag x))
+        ((and (jreify? x) (not (jreify-delegate x)))
+         (or (reify-class-name x) "clojure.lang.IObj$reify__0"))
+        (else #f)))
+(define (class-fast-probes)
+  (append (list jolt-nil #t #f 0 1.5 (expt 2 70) 1/3 "s" #\a
+                (keyword #f "class-probe") (jolt-symbol #f "class-probe"))
+          (probe-if-available (lambda () (jolt-vector 1)))
+          (probe-if-available (lambda () (jolt-hash-map (keyword #f "a") 1)))
+          (probe-if-available (lambda () (jolt-hash-set 1)))
+          (probe-if-available (lambda () (list->cseq (list 1))))
+          (probe-if-available (lambda () jolt-empty-list))
+          ;; the record constructor, not jolt-make-lazy-seq: lazy-bridge.ss loads
+          ;; after this file and its arms register, and an unbound reference is
+          ;; not a catchable condition in the whole-program release compile
+          (probe-if-available (lambda () (make-jolt-lazyseq (lambda () jolt-nil) jolt-nil #f jolt-nil)))
+          (probe-if-available (lambda () jrec-fast-type-probe))
+          (probe-if-available (lambda () (make-reified (jolt-hash-map))))))
+(define (class-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (class-fast-probes) "the (class x) fast path")
+  (reject-fast-type-claim! who pred (ref-kind-probes) "instance?'s per-kind memo"))
+;; The reference and deferred values instance? memoizes by kind
+;; (records-interop.ss ref-kind-key). The runtime's own class arms name their
+;; classes, one arm per type, so the answer is a function of the kind; a library
+;; arm could decide from what one holds, and the memo would keep its first answer.
+(define (ref-kind-probes)
+  (append (probe-if-available (lambda () (jolt-atom-new 0)))
+          (probe-if-available (lambda () (jolt-ref-new 0)))
+          (probe-if-available (lambda () (make-jvol 0)))
+          (probe-if-available (lambda () (jolt-var "clojure.core" "*ns*")))
+          (ref-kind-extra-probes)))
+
+;; ---- seq flavor -> JVM class --------------------------------------------------
+;; The one place the sk-* tags a cseq cell carries (seq.ss) become clojure.lang.*
+;; names. Everything that asks "what class is this seq" — (class …) below, protocol
+;; dispatch's value-host-tags, instance?, counted? — reads THIS vector, so the
+;; answers cannot drift apart the way two hand-kept conds did: (class (seq [1 2]))
+;; said PersistentList while (list? (seq [1 2])) said false.
+;;
+;; Indexed by kind, sized from sk-count, so adding a flavor in seq.ss is a
+;; compile-time-obvious one-line addition here and nothing else.
+(define seq-kind-class-v
+  (let ((v (make-vector sk-count "clojure.lang.Cons")))
+    (vector-set! v sk-cons          "clojure.lang.Cons")
+    (vector-set! v sk-list          "clojure.lang.PersistentList")
+    (vector-set! v sk-chunked-seq   "clojure.lang.PersistentVector$ChunkedSeq")
+    (vector-set! v sk-chunked-cons  "clojure.lang.ChunkedCons")
+    (vector-set! v sk-string-seq    "clojure.lang.StringSeq")
+    (vector-set! v sk-rseq          "clojure.lang.APersistentVector$RSeq")
+    (vector-set! v sk-arraymap-seq  "clojure.lang.PersistentArrayMap$Seq")
+    (vector-set! v sk-hashmap-seq   "clojure.lang.PersistentHashMap$NodeSeq")
+    (vector-set! v sk-treemap-seq   "clojure.lang.PersistentTreeMap$Seq")
+    (vector-set! v sk-key-seq       "clojure.lang.APersistentMap$KeySeq")
+    (vector-set! v sk-val-seq       "clojure.lang.APersistentMap$ValSeq")
+    (vector-set! v sk-long-range    "clojure.lang.LongRange")
+    (vector-set! v sk-range         "clojure.lang.Range")
+    (vector-set! v sk-iterate       "clojure.lang.Iterate")
+    (vector-set! v sk-repeat        "clojure.lang.Repeat")
+    (vector-set! v sk-cycle         "clojure.lang.Cycle")
+    (vector-set! v sk-array-seq     "clojure.lang.ArraySeq")
+    (vector-set! v sk-array-int     "clojure.lang.ArraySeq$ArraySeq_int")
+    (vector-set! v sk-array-long    "clojure.lang.ArraySeq$ArraySeq_long")
+    (vector-set! v sk-array-short   "clojure.lang.ArraySeq$ArraySeq_short")
+    (vector-set! v sk-array-double  "clojure.lang.ArraySeq$ArraySeq_double")
+    (vector-set! v sk-array-float   "clojure.lang.ArraySeq$ArraySeq_float")
+    (vector-set! v sk-array-bool    "clojure.lang.ArraySeq$ArraySeq_boolean")
+    (vector-set! v sk-array-byte    "clojure.lang.ArraySeq$ArraySeq_byte")
+    (vector-set! v sk-array-char    "clojure.lang.ArraySeq$ArraySeq_char")
+    ;; an array's own seq: the same class as the element-holding flavor
+    (do ((k sk-array-seq (fx+ k 1))) ((fx>? k sk-array-char))
+      (vector-set! v (fx+ k (fx- sk-array-cells-seq sk-array-seq)) (vector-ref v k)))
+    v))
+;; One vector-ref. This sits on the protocol-dispatch path for every seq argument,
+;; which is why the flavor is a fixnum index and not a name to be looked up.
+(define (cseq-class-name s) (vector-ref seq-kind-class-v (cseq-kind s)))
+
+;; Graft clojure.lang.IChunkedSeq onto exactly the flavors that chunk. sk-chunked?
+;; (seq.ss) is the single statement of which those are, because that tier is what
+;; implements chunk-first/chunk-rest; deriving the interface from it here is what
+;; keeps (chunked-seq? x) and (instance? IChunkedSeq x) from ever disagreeing.
+(let loop ((k 0))
+  (when (fx<? k sk-count)
+    (when (sk-chunked? k)
+      (jch-register-supers! (vector-ref seq-kind-class-v k) '("clojure.lang.IChunkedSeq")))
+    (loop (fx+ k 1))))
+
+;; Which flavors are Counted, derived FROM the graph rather than listed again — the
+;; rows in class-hierarchy.ss are the only statement of it, so counted? cannot
+;; disagree with instance? or ancestors. Memoized per kind behind the graph's
+;; generation counter: the graph is extensible (a library can graft supers onto a
+;; class at any time), and a cached answer computed against the old graph must not
+;; outlive it. Steady state is two fixnum compares and a vector-ref.
+(define seq-kind-counted-v #f)
+(define seq-kind-counted-epoch -1)
+(define (seq-kind-counted-vec)
+  (if (and seq-kind-counted-v (fx=? seq-kind-counted-epoch jch-graph-epoch))
+      seq-kind-counted-v
+      (let ((v (make-vector sk-count #f))
+            (epoch jch-graph-epoch))    ; read BEFORE the walk, like jch-closure
+        (let loop ((k 0))
+          (when (fx<? k sk-count)
+            (vector-set! v k (and (jch-isa? (vector-ref seq-kind-class-v k)
+                                            "clojure.lang.Counted")
+                                  #t))
+            (loop (fx+ k 1))))
+        (set! seq-kind-counted-epoch epoch)
+        (set! seq-kind-counted-v v)
+        v)))
+(define (cseq-counted? s) (vector-ref (seq-kind-counted-vec) (cseq-kind s)))
+(define (jolt-class-base x)
+  (cond
+    ((jolt-nil? x) jolt-nil)
+    ((boolean? x) "java.lang.Boolean")
+    ;; per-type number classes, like the JVM: integer -> Long, flonum -> Double,
+    ;; exact non-integer -> Ratio.
+    ((and (number? x) (flonum? x)) "java.lang.Double")
+    ;; split at the long range (jolt-bigint-print?'s boundary, shared with the
+    ;; printer's N suffix), not the 61-bit fixnum range: Long/MAX_VALUE is a
+    ;; Chez bignum but a JVM Long. Beyond long is the JVM's BigInt — the class
+    ;; a value of that magnitude has there (big literals, *' promotion). #627.
+    ((and (number? x) (exact? x) (integer? x))
+     (if (jolt-bigint-print? x) "clojure.lang.BigInt" "java.lang.Long"))
+    ((and (number? x) (exact? x) (rational? x)) "clojure.lang.Ratio")
+    ((number? x) "java.lang.Number")
+    ((string? x) "java.lang.String")
+    ((keyword? x) "clojure.lang.Keyword")
+    ((symbol-t? x) "clojure.lang.Symbol")
+    ((jolt-atom? x) "clojure.lang.Atom")
+    ((jolt-ref? x) "clojure.lang.Ref")
+    ((jolt-reduced? x) "clojure.lang.Reduced")
+    ((or (char? x) (jsurr? x)) "java.lang.Character")
+    ((regex-t? x) "java.util.regex.Pattern")
+    ;; a stateful matcher (re-matcher) is a java.util.regex.Matcher, as the
+    ;; record's own comment in regex.ss already said — without this arm it fell
+    ;; through to (jolt-type x) and (class m) was :object. #998.
+    ((matcher-t? x) "java.util.regex.Matcher")
+    ;; a fn no class arm names: neither a literal the compiler registered with
+    ;; its class (procedure-class-name, below) nor a def'd var's -- the runtime's
+    ;; own procedures, and every fn on a host with no code names. The $fn marker
+    ;; lets clojure.spec.alpha's fn-sym recognize it as anonymous.
+    ((procedure? x) "clojure.lang.AFunction$fn__0")
+    ;; an exception value (ex-info record / host-constructed throwable) reports its JVM
+    ;; class, so (= clojure.lang.ExceptionInfo (class e)) and clojure.test's
+    ;; (thrown? Class …) match (records-interop.ss ex-info-map?/ex-info-class).
+    ((ex-info-map? x) (ex-info-class x))
+    ;; persistent collections + namespace report their JVM class names (not jolt's
+    ;; internal :vector/:set/… type keyword), so class-based dispatch — e.g. a
+    ;; defmulti on [(class a) (class b)] — sees a real clojure.lang.* class.
+    ((jns? x) "clojure.lang.Namespace")
+    ;; a map entry is a pvec with the entry kind; the JVM class is MapEntry
+    ((jolt-map-entry? x) "clojure.lang.MapEntry")
+    ;; a subvec view is a pvec with the subvec kind (issue #629)
+    ((jolt-subvec-view? x) "clojure.lang.APersistentVector$SubVector")
+    ((pvec? x) "clojure.lang.PersistentVector")
+    ((pset? x) "clojure.lang.PersistentHashSet")
+    ;; array mode (insertion-ordered, small literal maps) is PersistentArrayMap;
+    ;; hash mode (hash-map, or grown past the array limit) is PersistentHashMap
+    ((pmap? x) (if (pmap-array? x) "clojure.lang.PersistentArrayMap"
+                   "clojure.lang.PersistentHashMap"))
+    ((jolt-lazyseq? x) "clojure.lang.LazySeq")
+    ((empty-list-t? x) "clojure.lang.PersistentList$EmptyList")
+    ;; …whichever concrete seq class this cell's flavor says it is
+    ((cseq? x) (cseq-class-name x))
+    (else (jolt-str-render-one (jolt-type x)))))
+;; the class NAME of x (string), or nil for nil. (class x) wraps it in a Class
+;; value (make-class-obj, host-static-classes.ss) so it renders like a JVM Class
+;; while staying = its name string.
+;; No condition? class-arm: a raw Chez condition never reaches the class-name
+;; chain, because every one a catch binds has become a typed throwable at the
+;; boundary (jolt-unwrap-throw, java/host-faults.ss).
+;; A fn def'd into a var reports a JVM-style class name "ns$munged-name" (the
+;; forward CHAR_MAP), so clojure.spec.alpha's fn-sym (which splits on $ and
+;; demunges) recovers the predicate's symbol. Anonymous / unregistered fns stay
+;; clojure.lang.IFn (fn-sym yields :unknown, as on the JVM).
+;;
+;; The table below IS clojure.lang.Compiler/CHAR_MAP, character by character, and
+;; it is the ONE forward munge table. It lives here rather than beside demunge
+;; (compile-eval.ss) only because of load order: rt.ss loads this file and
+;; compile-eval.ss comes after it, so this is the earlier of the two ends and the
+;; later one derives from it — Compiler/CHAR_MAP, Compiler/munge and the demunge
+;; token table are all built out of this alist, so no two of them can name
+;; different escapes for one character. It used to hold 15 of the JVM's 24
+;; entries, which is why (class clojure.core/+') reported "clojure.core$_PLUS_'":
+;; a name no JVM emits, demunge cannot reverse, and Java would not accept as an
+;; identifier.
+(define class-munge-map
+  '((#\- . "_") (#\: . "_COLON_") (#\+ . "_PLUS_") (#\> . "_GT_")
+    (#\< . "_LT_") (#\= . "_EQ_") (#\~ . "_TILDE_") (#\! . "_BANG_")
+    (#\@ . "_CIRCA_") (#\# . "_SHARP_") (#\' . "_SINGLEQUOTE_")
+    (#\" . "_DOUBLEQUOTE_") (#\% . "_PERCENT_") (#\^ . "_CARET_")
+    (#\& . "_AMPERSAND_") (#\* . "_STAR_") (#\| . "_BAR_") (#\{ . "_LBRACE_")
+    (#\} . "_RBRACE_") (#\[ . "_LBRACK_") (#\] . "_RBRACK_") (#\/ . "_SLASH_")
+    (#\\ . "_BSLASH_") (#\? . "_QMARK_")))
+(define (class-munge-name s)
+  (let ((out (open-output-string)))
+    (string-for-each
+     (lambda (c) (let ((t (assv c class-munge-map))) (if t (display (cdr t) out) (write-char c out))))
+     s)
+    (get-output-string out)))
+;; clojure.lang.Compiler/demunge — reverse the name munging Clojure applies to
+;; build JVM class/method names, so "clojure.core$odd_QMARK_" -> clojure.core/odd?.
+;; clojure.spec.alpha's fn-sym uses it to recover a symbol from a fn's class name.
+;; Longest tokens first; a standalone _ is a hyphen; $ separates ns from name.
+;;
+;; Derived from class-munge-map (java/host-class.ss), the forward table, so the two
+;; directions cannot drift: every escape demunge reverses is one munge emits. The
+;; hyphen row is dropped — its escape is a bare "_", which demunge handles as its
+;; own rule below rather than as a token — and "_DOT_" is added, an escape jolt
+;; reverses although Clojure's CHAR_MAP never produces it. Sorted longest token
+;; first so a scan cannot stop at a shorter token that prefixes a longer one.
+(define demunge-token-map
+  (sort (lambda (a b) (fx>? (string-length (car a)) (string-length (car b))))
+        (cons '("_DOT_" . ".")
+              (fold-left (lambda (acc p)
+                           (if (string=? (cdr p) "_")
+                               acc
+                               (cons (cons (cdr p) (string (car p))) acc)))
+                         '()
+                         class-munge-map))))
+(define (compiler-demunge s)
+  (let* ((s (if (string? s) s (jolt-str-render-one s)))
+         (n (string-length s))
+         (out (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i n) (get-output-string out)
+          (let ((tok (let scan ((ts demunge-token-map))
+                       (cond ((null? ts) #f)
+                             ((let ((t (caar ts)))
+                                (and (<= (+ i (string-length t)) n)
+                                     (string=? (substring s i (+ i (string-length t))) t)))
+                              (car ts))
+                             (else (scan (cdr ts)))))))
+            (cond
+              (tok (display (cdr tok) out) (loop (+ i (string-length (car tok)))))
+              ((char=? (string-ref s i) #\_) (write-char #\- out) (loop (+ i 1)))
+              ((char=? (string-ref s i) #\$) (write-char #\/ out) (loop (+ i 1)))
+              (else (write-char (string-ref s i) out) (loop (+ i 1)))))))))
+;; A fn's class. A literal the compiler registered reports the class Compiler
+;; would have compiled it into (ns$f$fn__N, the analyzer's name for its site,
+;; fn-form-registry.ss), whatever var it was later stored in -- a closure made
+;; by mk and def'd as f2 is still mk's fn__N, as on the JVM. A fn a def names
+;; directly (defn) has no registration and is ns$name.
+(define procedure-class-name-hook (lambda (p) #f))
+(define (procedure-class-name x)
+  (and (procedure? x)
+       ;; a deftype or defrecord name evaluates to its constructor, which stands
+       ;; for the class itself (class?, and = to (class instance)), so its class
+       ;; is Class, as (class SomeType) is on the JVM
+       (or (and (deftype-ctor-tag x) "java.lang.Class")
+           (procedure-class-name-hook x)
+           (let ((p (proc-name-of x)))
+             (and p (var-fn-class-name (car p) (cdr p)))))))
+;; The class of the fn a var ns/name holds: ns$name -- the ns segment munges too
+;; (a-b.core -> a_b.core), like Compiler.munge; dots stay -- except the
+;; clojure.core vars the reference does not define as a plain defn: an early
+;; (def x (fn ^:static x ..)) is the class x__N, (def not-any? (comp not some))
+;; comp's fn, list the Primordial. Clojure 1.12.6's names; its clojure.core is
+;; AOT-compiled, so they are fixed.
+(define core-var-fn-classes
+  (let ((t (make-hashtable string-hash string=?)))
+    (for-each (lambda (p) (hashtable-set! t (car p) (cdr p)))
+      '(("assoc" . "clojure.core$assoc__5500") ("butlast" . "clojure.core$butlast__5514")
+        ("char?" . "clojure.core$char_QMARK___5492") ("conj" . "clojure.core$conj__5474")
+        ("cons" . "clojure.core$cons__5460") ("defn" . "clojure.core$defn__5516")
+        ("ffirst" . "clojure.core$ffirst__5478") ("first" . "clojure.core$first__5468")
+        ("fnext" . "clojure.core$fnext__5482") ("instance?" . "clojure.core$instance_QMARK___5488")
+        ("last" . "clojure.core$last__5512") ("list" . "clojure.lang.PersistentList$Primordial")
+        ("map?" . "clojure.core$map_QMARK___5496") ("meta" . "clojure.core$meta__5502")
+        ("next" . "clojure.core$next__5470") ("nfirst" . "clojure.core$nfirst__5480")
+        ("nnext" . "clojure.core$nnext__5484") ("not-any?" . "clojure.core$comp$fn__5895")
+        ("not-every?" . "clojure.core$comp$fn__5895") ("rest" . "clojure.core$rest__5472")
+        ("second" . "clojure.core$second__5476") ("seq" . "clojure.core$seq__5486")
+        ("seq?" . "clojure.core$seq_QMARK___5490") ("string?" . "clojure.core$string_QMARK___5494")
+        ("vector?" . "clojure.core$vector_QMARK___5498") ("with-meta" . "clojure.core$with_meta__5504")))
+    t))
+(define (var-fn-class-name ns nm)
+  (or (and (string=? ns "clojure.core") (hashtable-ref core-var-fn-classes nm #f))
+      (string-append (class-munge-name ns) "$" (class-munge-name nm))))
+(register-class-arm! procedure-class-name procedure-class-name)
+
+;; The arm walk's answer for the last value it named, as one (value . name)
+;; pair replaced whole: an object's class does not change, and one print asks
+;; several times (the print-method lookup, #object[cls … "cls@hash"]). The pair
+;; holds its value WEAKLY where the host has weak pairs (host-static.ss installs
+;; weak-cons), so the memo keeps nothing alive; with no such pair it is off.
+(define class-name-memo-cons (lambda (x n) #f))
+(define (set-class-name-memo-cons! f) (set! class-name-memo-cons f))
+(define (jolt-class-name x)
+  (or (class-fast-name x)
+      (let ((c jolt-class-name-last))
+        (if (eq? (car c) x)
+            (cdr c)
+            (let ((n (let loop ((as (class-arms-for jolt-class-arms x)))
+                       (cond ((null? as) (jolt-class-base x))
+                             (((caar as) x) ((cdar as) x))
+                             (else (loop (cdr as)))))))
+              (let ((m (class-name-memo-cons x n)))
+                (when m (set! jolt-class-name-last m)))
+              n)))))
+;; A Class is ONE object per class, as on the JVM: (class 1) and (class 2) hand
+;; back the same token, and it is the same token the class-name symbol Long
+;; evaluates to. That makes identical? on two Class values a class-equality test,
+;; which library code takes for granted — typedclojure dispatches its whole
+;; RClass-vs-RClass subtype rule behind (identical? (.getClass s) (.getClass t)),
+;; so a fresh token per call answered false there and skipped the rule outright.
+;; jolt-class-for is the interner every other class seam already went through
+;; (a class token, resolve, supers, Class/forName); this was the one that minted
+;; its own. It also canonicalizes the spelling, so a deftype in a dashed
+;; namespace lands on the token its own values report.
+;; A fn literal's Class token straight from its registration (fn-form-registry.ss),
+;; or #f -- the same class the arm below names, without the arm walk and the
+;; interning of the name per call.
+(define procedure-class-token-hook (lambda (p) #f))
+(define (jolt-class x)
+  (cond
+    ;; built before its type was redefined: the old class (class-model.ss)
+    ((jrec-retired? x) (jolt-retired-class-token (jrec-desc x)))
+    ((and (procedure? x) (procedure-class-token-hook x)))
+    (else
+     (let ((n (jolt-class-name x)))
+       (if (jolt-nil? n) jolt-nil (jolt-class-for n))))))
+
+(def-var! "clojure.core" "class" jolt-class)
+
+;; Util.compare's last step is ((Comparable) a).compareTo(b), so compare and sort
+;; take every Comparable class, not only the ones that registered a compare arm:
+;; a value the class model says is Comparable answers through its own compareTo.
+;; Without this a java.nio.file.Path (babashka.fs/list-dir's elements), a File,
+;; a StringBuilder or an enum constant had a working .compareTo that compare
+;; never asked, and (sort (fs/list-dir d)) raised (jolt-lang/jolt#1395).
+;; The two values must share a class. On the JVM a mismatched pair is refused by
+;; compareTo's own cast; here the runtime's own types (a keyword against a
+;; symbol, a vector against a map) have no compareTo to refuse it, so the class
+;; check stands in for that cast and the refusal stays the ClassCastException.
+(set! jolt-compare-miss
+  (lambda (a b)
+    (let ((ca (jolt-class-name a)))
+      (if (and (string? ca)
+               (equal? ca (jolt-class-name b))
+               (jch-isa? ca "java.lang.Comparable"))
+          (jnum->exact (record-method-dispatch a "compareTo" (jolt-list b)))
+          (jolt-compare-incomparable a b)))))
+
+;; The PUBLIC clojure.core/type — Clojure's (or (:type meta) (class x)). This is the
+;; java host layer's job: the core taxonomy (natives-meta.ss jolt-type, kept under
+;; __type-tag for print-method) is JVM-free, and the JVM class mapping lives HERE,
+;; next to (class …). The inst/array/byte-buffer host files extend `class` (a
+;; class-arm or jolt-type fallthrough) and re-point `type` at this same fn, so the
+;; remap of every value — :jolt/inst -> java.util.Date etc. — happens in one place.
+(define ty-meta-key (keyword #f "type"))
+(define (jolt-type-pub x)
+  (let* ((m (jolt-meta x))
+         (override (if (jolt-nil? m) jolt-nil (jolt-get m ty-meta-key jolt-nil))))
+    (if (not (jolt-nil? override)) override (jolt-class x))))
+(def-var! "clojure.core" "type" jolt-type-pub)
+
+;; bare class-name tokens -> canonical JVM class-name strings, derived from the
+;; modeled class graph (jvm-class-parents) so this list stays current with any
+;; additions to class-hierarchy.ss.
+;;
+;; Keyed by the name a namespace would MAP the class under — the part after the
+;; last dot, $ and all (java.util.Map$Entry -> Map$Entry, java.lang.Thread$State
+;; -> Thread$State), which is what the JVM imports. jch-last-segment goes on past
+;; the $ because its job is the alternative spelling a protocol extension may use;
+;; taking that as an import name minted a clojure.core/Entry and a
+;; clojure.core/Seq the JVM has no mapping for, and left the two nested auto-
+;; imports with no token at all.
+(define class-token-alist
+  (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+    (let ((result '()) (seen (make-hashtable string-hash string=?)))
+      (vector-for-each
+        (lambda (k _)
+          (let ((s (jch-import-name k)))
+            (when (not (hashtable-ref seen s #f))
+              (hashtable-set! seen s #t)
+              (set! result (cons (cons s k) result)))))
+        keys vals)
+      (reverse result))))
+
+;; resolve a ^Type hint symbol-name to its canonical class name at def time:
+;; "String" -> "java.lang.String", matching the JVM compiler. An
+;; already-canonical name maps to itself; an unknown name yields #f (left as-is).
+(define class-hint-table (make-hashtable string-hash string=?))
+(for-each (lambda (p) (hashtable-set! class-hint-table (car p) (cdr p))) class-token-alist)
+(for-each (lambda (p) (hashtable-set! class-hint-table (cdr p) (cdr p))) class-token-alist)
+(define (resolve-class-hint name) (hashtable-ref class-hint-table name #f))
+(def-var! "jolt.host" "resolve-class-hint" resolve-class-hint)
+
+;; fully-qualified canonical class names — value classes only, NOT the collection
+;; interfaces (ISeq/IPersistentMap/...), which downstream code (e.g. SCI) references
+;; as protocols/interfaces. def-var! into clojure.core happens in
+;; host-static-classes.ss (after make-class-obj is loaded) so tokens evaluate to
+;; Class objects.
+(define class-fqn-list
+  (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+    (let ((result '()))
+      (vector-for-each
+        (lambda (k _)
+          (when (or (not (jch-interface? k))
+                    (string=? k "clojure.lang.IExceptionInfo"))
+            (set! result (cons k result))))
+        keys vals)
+      (reverse result))))
+
+;; The hex an object's default toString appends is Integer.toHexString of its
+;; hashCode, i.e. its IDENTITY hash. equal-hash is not that: it answers one
+;; constant for every procedure (hasheq.ss records the measurement), so every
+;; anonymous fn rendered the same string and a two-operand cast error named
+;; both operands identically. jolt-identity-hasheq is the per-object id
+;; (hash f) already reports — the same number the JVM prints. Rendering it
+;; unsigned over 32 bits is what Integer.toHexString does; the old (abs …)
+;; collapsed h and -h onto one string.
+(define (jolt-identity-hex x) (jolt-hex32 (jolt-identity-hasheq x)))
+;; Integer.toHexString: N's low 32 bits unsigned, lowercase, no leading zeros.
+;; Sized from the bit length and filled from the right, one allocation: #object
+;; printing pays this per value, and an 8-wide buffer cut down by substring was
+;; two of them and a copy.
+(define (jolt-hex32 h)
+  (let* ((n (bitwise-and h #xffffffff))
+         (len (if (fx=? n 0) 1 (fxsrl (fx+ (fxlength n) 3) 2)))
+         (buf (make-string len)))
+    (let loop ((n n) (i (fx- len 1)))
+      (string-set! buf i (string-ref "0123456789abcdef" (fxand n 15)))
+      (if (fx=? i 0) buf (loop (fxsrl n 4) (fx- i 1))))))
+;; (str f) of a fn renders JVM-style — "ns$name@hexhash" — so code that parses
+;; fn identity out of the string (expound's pprint-fn) finds the $-separated
+;; class name instead of a raw Chez #<procedure> form.
+(register-str-render!
+  (lambda (x) (procedure? x))
+  (lambda (x) (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))
+;; str of a reify or a proxy that declares no toString is Object.toString,
+;; Class@hash, as on the JVM (a proxy over a java.util collection renders as the
+;; collection through its own arm). Without this it fell through to the printer
+;; and came back as the whole #object[...] form.
+;;
+;; A proxy whose BASE class has a toString of its own inherits it, though: str of
+;; a proxy over java.io.StringWriter is the text written to it, as (.toString p)
+;; already answered through the delegate. It rendered as the proxy's Class@hash,
+;; so the two disagreed (#1683). A base that keeps Object.toString renders as
+;; Class@hash or the #object form, and then the proxy's own Class@hash is right.
+(define (proxy-base-str x)
+  (let ((d (jreify-delegate x)))
+    (and d
+         (let ((s (jolt-str-render-one d))
+               (cn (jolt-class-name d)))
+           (define (starts? p)
+             (and (>= (string-length s) (string-length p))
+                  (string=? (substring s 0 (string-length p)) p)))
+           (and (string? cn)
+                (not (starts? (string-append cn "@")))
+                (not (starts? "#object["))
+                s)))))
+(register-str-render!
+  (lambda (x) (and (jreify? x) (not (reify-method-ref x "toString")) (not (proxy-coll-kind x))))
+  (lambda (x)
+    (if (and (jreify-delegate x) (jolt-ex-info-record? (jreify-delegate x)))
+        ;; a proxy over a Throwable class: Throwable.toString, the proxy's class
+        ;; and its (possibly overridden) message
+        ;; getLocalizedMessage is getMessage unless the proxy writes its own, so
+        ;; an overridden getMessage shows through
+        (let ((m (record-method-dispatch x (if (reify-method-ref x "getLocalizedMessage") "getLocalizedMessage" "getMessage") jolt-nil)))
+          (if (jolt-nil? m) (jolt-class-name x) (string-append (jolt-class-name x) ": " (jolt-str-render-one m))))
+        (or (proxy-base-str x)
+            (string-append (jolt-class-name x) "@" (jolt-identity-hex x))))))
+;; pr/print of a fn uses the JVM object form — #object[ns$name 0xHASH
+;; "ns$name@HASH"] — which fn-identity parsers (lasertag's resolve-fn-name)
+;; read the class name out of.
+(define (jolt-fn-object-form x)
+  (let ((cn (jolt-class-name x))
+        (h (jolt-identity-hex x)))
+    (string-append "#object[" cn " 0x" h " \"" cn "@" h "\"]")))
+(register-pr-arm! (lambda (x) (procedure? x)) jolt-fn-object-form)
+;; print of a fn uses the same #object form as pr (the JVM prints fns through
+;; print-method Object on both paths); str keeps the bare cn@hash.
+(let ((prev (var-deref "clojure.core" "__print1")))
+  (def-var! "clojure.core" "__print1"
+    (lambda (x)
+      (if (procedure? x) (jolt-fn-object-form x) (jolt-invoke1 prev x)))))

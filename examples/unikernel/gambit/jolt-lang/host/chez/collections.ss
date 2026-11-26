@@ -1,0 +1,2160 @@
+;; persistent collections on the Chez RT.
+;;
+;; The vector / map / set the emitted programs construct from literals and
+;; operate on via the lowered leaf ops (conj/get/nth/count/assoc/...). Loaded by
+;; rt.ss after values.ss; jolt=2 / jolt-hash (values.ss) call into the
+;; jolt-coll? / jolt-coll=? / jolt-coll-hash hooks defined here (forward refs,
+;; resolved at run time — nothing is CALLED during load).
+;;
+;; The persistent vector is a copy-on-write Scheme vector and the map/set are a
+;; bitmap HAMT. They live in Scheme; correctness, not perf, is the gate.
+
+;; ============================================================================
+;; small immutable-vector helpers
+;; ============================================================================
+;; No copy here is a checked Scheme loop: the runtime compiles at
+;; optimize-level 2, where such a loop pays a type and bounds check per element
+;; (a 64-slot copy measured 390ns). Whole vectors and computed ranges (a node
+;; update, vec-copy-range, vec-insert) are the target's block copy INTO A FRESH
+;; vector (sa-vector-copy / sa-subvector): no initializing fill and no write
+;; barrier per slot, 19ns for 32 slots against 82 for the unchecked loop below
+;; and 86 for Chez's vector-copy!, which is that same barriered loop. What still
+;; copies into a vector made first (vec-remove, the array-map's append/remove)
+;; runs the unchecked loop or the checked bulk move. Never a bare vector-copy:
+;; the vendored irregex redefines that name at top level as a one-argument loop.
+(define (vec-copy-range v start end) (sa-subvector v start end))
+;; copy of v with x spliced in at index i: the two halves are block copies into
+;; fresh vectors (sa-subvector), which beats copying into one made up front
+(define (vec-insert v i x)
+  (sa-vector-append (sa-subvector v 0 i) (vector x) (sa-subvector v i (vector-length v))))
+(define (vec-remove v i)              ; copy of v with index i dropped
+  (let* ((n (vector-length v)) (out (make-vector (fx- n 1))))
+    (sa-vector-copy-range! out 0 v 0 i)
+    (sa-vector-copy-range! out i v (fx+ i 1) n)
+    out))
+;; slots 0..n-1 of v into out, unchecked: out was just made at least n long
+(define (vec-fill-prefix! out v n)
+  (let loop ((j 0))
+    (when (sa-ufx<? j n)
+      (sa-uvector-set! out j (sa-uvector-ref v j))
+      (loop (sa-ufx+ j 1)))))
+;; functional update at index i. A block copy (sa-vector-copy), not make-vector and a copy loop:
+;; it fills a fresh, uninitialized vector in one block move, where the loop paid
+;; the zero fill and a write barrier per slot (82 ns against 19 for a 32-slot
+;; node -- the path copy on every level of every persistent assoc and conj).
+(define (vec-set v i x)
+  (let ((out (sa-vector-copy v)))
+    (vector-set! out i x)
+    out))
+;; the two below serve the array-mode map's k/v slot vector
+(define (vec-append2 v k x)           ; copy of v with k and x appended
+  (let* ((n (vector-length v)) (out (make-vector (fx+ n 2))))
+    (vec-fill-prefix! out v n)
+    (vector-set! out n k) (vector-set! out (fx+ n 1) x)
+    out))
+(define (vec-remove2 v i)             ; copy of v with slots i and i+1 dropped
+  (let* ((n (vector-length v)) (out (make-vector (fx- n 2))))
+    (vec-fill-prefix! out v i)
+    ;; the tail, shifted down two: j runs i+2..n-1 into i..n-3
+    (let loop ((j (fx+ i 2)))
+      (when (sa-ufx<? j n)
+        (sa-uvector-set! out (sa-ufx- j 2) (sa-uvector-ref v j))
+        (loop (sa-ufx+ j 1))))
+    out))
+
+;; ============================================================================
+;; persistent vector — 32-way trie + tail (Clojure's PersistentVector)
+;; ============================================================================
+;; cnt elements live in a trie of 32-wide nodes (root, height = shift bits) plus a
+;; trailing `tail` chunk of 1..32. conj appends to the tail and, when it fills,
+;; pushes it into the trie by path-copy — so conj is O(1) amortized and a linear
+;; build is O(n), not the O(n^2) of a flat copy-on-write array. nth/assoc/pop are
+;; O(log32 n). Trie nodes are Scheme vectors holding only their live children
+;; (grown left-to-right), so a node's length is its child count.
+;;
+;; `ent` #t marks a MAP ENTRY (the [k v] pair seq'd out of a map). An entry has 2
+;; elements (all in the tail), equals its [k v] vector and walks like one, and is
+;; both vector? (Clojure's MapEntry implements IPersistentVector) and map-entry?.
+;; Modifying an entry (conj/assoc/pop) yields a plain vector (ent #f).
+;;
+;; make-pvec and pvec-v keep the old flat-vector API: make-pvec builds a trie from
+;; a Scheme vector (every existing caller still passes one) and pvec-v materializes
+;; it back, so only this file's internals change.
+(define pv-bits 5)
+(define pv-width 32)
+(define pv-mask 31)
+(define pv-empty-node (vector))
+;;
+;; The pvec record (cnt shift root tail ent hasheq meta, chez-pvec-v4) is
+;; defined in values.ss with the other collection layouts, ahead of every
+;; dispatcher; mk-pvec fills the hasheq and meta defaults.
+(define (mk-pvec cnt shift root tail ent)
+  (%mk-pvec cnt shift root tail ent 0 jolt-nil))
+
+;; `ent` is the vector's KIND, not just the entry flag: #f = plain vector,
+;; #t = map entry (above), 'subvec = a subvec view (class
+;; clojure.lang.APersistentVector$SubVector — issue #629). One shared
+;; representation; only the class answer and its jch tags differ. Readers must
+;; test the kind explicitly, never truthiness.
+;;
+;; The kind a modifying op's result carries: an entry decays to a plain vector
+;; (documented above), a subvec stays a subvec — the JVM's SubVector answers
+;; cons/assocN/pop with a SubVector.
+(define (pv-derived-ent p) (let ((e (pvec-ent p))) (if (eq? e #t) #f e)))
+;; same structure, same cached hash, a different kind and no metadata (a subvec
+;; is a fresh nil-meta view, RT.subvec's; an entry never carries any)
+(define (pvec-with-ent p e)
+  (if (eq? (pvec-ent p) e)
+      p
+      (%mk-pvec (pvec-cnt p) (pvec-shift p) (pvec-root p) (pvec-tail p) e (pvec-hasheq p) jolt-nil)))
+;; the public subvec stamp: a non-empty slice is a SubVector; an empty one is
+;; RT.subvec's PersistentVector.EMPTY, so it stays plain
+(define (pvec-as-subvec r)
+  (if (and (pvec? r) (fx>? (pvec-cnt r) 0)) (pvec-with-ent r 'subvec) r))
+
+;; trailing helpers over Scheme vectors used by the trie
+(define (vec-snoc v x)                 ; copy v with x appended
+  (let* ((n (vector-length v)) (out (make-vector (fx+ n 1))))
+    (sa-vector-copy-range! out 0 v 0 n)
+    (vector-set! out n x) out))
+(define (vec-drop-last v) (vec-copy-range v 0 (fx- (vector-length v) 1)))
+(define (vec-take v n) (vec-copy-range v 0 n))
+(define (vec-set-or-snoc v i x)        ; replace index i, or append when i = length
+  (let ((n (vector-length v))) (if (fx<? i n) (vec-set v i x) (vec-snoc v x))))
+
+
+;; --- RRB relaxed nodes -------------------------------------------------------
+;; catvec/slice (below) produce RELAXED branch nodes: children needn't be full,
+;; so radix addressing gives way to a size-table search. A relaxed node is a
+;; dedicated record — a regular branch is a Scheme vector of children and a leaf
+;; is a chunk of ELEMENTS (which can themselves be Scheme vectors), so a record
+;; is the only representation whose discrimination is total: rrbnode? and
+;; vector? are disjoint, and a value is only ever treated as a node at level>0.
+;; sizes are CUMULATIVE subtree counts (sizes[k] = elements in children 0..k).
+;;
+;; Invariants:
+;;  - a pvec whose root is a plain vector is a CLASSIC PersistentVector trie
+;;    (full 32-wide leaves, 32-aligned tailoff) — every pre-RRB invariant holds
+;;    and every pre-RRB code path runs unchanged;
+;;  - a pvec whose root is an rrbnode may be arbitrary: the size tables are
+;;    authoritative and the tail is the last 0..32 elements (tailoff is
+;;    cnt - tail length, NOT the aligned formula);
+;;  - inside an RRB trie a plain-vector branch means LEFTWISE DENSE (all but
+;;    the last child fully dense), so radix addressing on a subtree-relative
+;;    index is valid from that node down.
+(define-record-type rrbnode (fields sizes children) (nongenerative chez-rrbnode-v1))
+
+;; first child whose cumulative size exceeds i (linear over <=32 slots)
+(define (rrb-find-child sizes i)
+  (let loop ((k 0))
+    (if (fx<=? (vector-ref sizes k) i) (loop (fx+ k 1)) k)))
+
+(define (pv-tailoff-of p) (fx- (pvec-cnt p) (vector-length (pvec-tail p))))
+
+;; leaf resolution: the chunk holding index i and i's offset within it. The
+;; classic trie keeps its radix descent (one rrbnode? test per level is the only
+;; added cost); a relaxed node switches to its size table and subtree-relative
+;; addressing from there down. At level 0 the low 5 bits are the offset for
+;; both absolute (classic) and relative (leftwise-dense subtree) indices.
+(define (pv-leaf-for p i)
+  (let ((tailoff (pv-tailoff-of p)))
+    (if (fx>=? i tailoff)
+        (values (pvec-tail p) (fx- i tailoff))
+        (let loop ((node (pvec-root p)) (level (pvec-shift p)) (i i))
+          (cond
+            ((fx=? level 0) (values node (fxand i pv-mask)))
+            ((rrbnode? node)
+             ;; a relaxed node below dense ancestors receives an unmasked index;
+             ;; its in-subtree part is the low level+5 bits (dense ancestors are
+             ;; aligned), and masking a subtree-relative index is the identity.
+             (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))
+                    (sizes (rrbnode-sizes node))
+                    (k (rrb-find-child sizes i))
+                    (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1))))))
+               (loop (vector-ref (rrbnode-children node) k) (fx- level pv-bits) sub)))
+            (else (loop (vector-ref node (fxand (fxsra i level) pv-mask))
+                        (fx- level pv-bits) i)))))))
+;; The element at index i below the tail offset, from NODE at LEVEL down (i is
+;; still the vector's own index): pv-leaf-for's descent ending in the read, so
+;; no leaf and offset come back as two values. The shift and mask are the
+;; literals pv-bits and pv-mask hold (5 and 31), so the loop doesn't reload them
+;; as top-level variables. The relaxed level is pv-leaf-for's.
+;; pvec-nth-in-range's inline dense descent hands over to it when it meets a
+;; relaxed node.
+(define (pv-trie-ref-from node level i)
+  (let loop ((node node) (level level) (i i))
+    (cond
+      ((fx=? level 0) (vector-ref node (fxand i 31)))
+      ((vector? node) (loop (vector-ref node (fxand (fxsra i level) 31)) (fx- level 5) i))
+      (else
+       (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))
+              (sizes (rrbnode-sizes node))
+              (k (rrb-find-child sizes i))
+              (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1))))))
+         (loop (vector-ref (rrbnode-children node) k) (fx- level pv-bits) sub))))))
+;; the 32-chunk Scheme vector holding index i (the tail or a trie leaf)
+(define (pv-chunk-for p i)
+  (let-values (((chunk off) (pv-leaf-for p i))) chunk))
+
+;; jolt models every number as a double, so vector indices arrive as flonums —
+;; coerce an integer-valued index to a Scheme fixnum before bounds math.
+(define (->idx i) (if (fixnum? i) i (if (flonum? i) (exact (fltruncate i)) i)))
+;; An int-indexed op (nth, aget, aset, subs, subvec, .charAt) takes its index
+;; through RT.intCast on the JVM before it looks at the collection: longCast
+;; (a double or bignum past the long range is IllegalArgumentException "Value
+;; out of range for long: x"), then Math.toIntExact (outside the int range is
+;; ArithmeticException "integer overflow"). No collection holds 2^31 elements,
+;; so every such index is out of bounds too, and the check lives on the
+;; out-of-bounds branches: an in-range read never pays for it. Returns when the
+;; index fits an int, for the caller's own bounds error.
+;;
+;; The KEYED ops are the other half: get, contains?, find, a vector invoked as
+;; a fn, assoc and assoc! read a key with Number.intValue, which keeps the low
+;; 32 bits instead of refusing, so (get [:a :b] 4294967297) is :b on the JVM.
+;; A vector takes only an integer key (Util.isInteger: a double is no index);
+;; a string or array takes any Number, a double truncated the way (int) casts.
+;; Number.intValue of an exact integer: its low 32 bits, signed.
+(define (int32-low n)
+  (let ((m (bitwise-and n #xFFFFFFFF)))
+    (if (>= m #x80000000) (- m #x100000000) m)))
+;; A vector's key as an index, or #f for a key that is not an integer.
+(define (vec-key-index k)
+  (cond ((fixnum? k) (if (and (fx>=? k -2147483648) (fx<=? k 2147483647)) k (int32-low k)))
+        ((and (number? k) (exact? k) (integer? k)) (int32-low k))
+        (else #f)))
+;; A string's or array's key as an index (RT.getFrom/contains), or #f for a key
+;; that is not a Number. A double is Java's (int) cast: NaN is 0, and past the
+;; int range it saturates.
+(define (num-key-index k)
+  (cond ((vec-key-index k))
+        ((flonum? k)
+         (cond ((not (fl= k k)) 0)
+               ((fl>= k 2147483647.0) 2147483647)
+               ((fl<= k -2147483648.0) -2147483648)
+               (else (exact (fltruncate k)))))
+        (else #f)))
+(define (index-int-check! i)
+  (cond ((fixnum? i)
+         (unless (and (fx>=? i -2147483648) (fx<=? i 2147483647))
+           (throw-jvm 'ArithmeticException "integer overflow")))
+        ((flonum? i)
+         (cond ((or (fl> i 9.223372036854775807e18) (fl< i -9.223372036854775808e18))
+                (throw-jvm 'IllegalArgumentException
+                           (string-append "Value out of range for long: " (jolt-str-render-one i))))
+              ((or (fl>= i 2147483648.0) (fl<= i -2147483649.0))
+               (throw-jvm 'ArithmeticException "integer overflow"))))
+        ((and (number? i) (exact? i) (integer? i))
+         (if (and (>= i -9223372036854775808) (<= i 9223372036854775807))
+             (throw-jvm 'ArithmeticException "integer overflow")
+             (throw-jvm 'IllegalArgumentException
+                        (string-append "Value out of range for long: " (number->string i)))))))
+(define (pvec-count p) (pvec-cnt p))
+;; jolt-nth's throwing pvec read as its own entry: the base definition's pvec
+;; arm and the fast path hoisted in front of the set! wrapper chain
+;; (natives-array.ss, the outermost link) share this ONE copy. The nil-index
+;; raise and ->idx coercion lived in jolt-nth ahead of type dispatch; a
+;; hoisted pvec case never reaches them, so both happen here, inlined — this
+;; is the hot read, every call frame in front of pv-leaf-for costs.
+;; The tail is tested HERE, before pv-leaf-for: every vector of 32 or fewer
+;; elements is all tail, and a tail index is one subtraction and a vector-ref,
+;; where pv-leaf-for's two-value return through let-values costs 9 of the 13 ns
+;; a small-vector nth used to take.
+;;
+;; A macro, not a procedure: every read of a vector element in the runtime
+;; (nth, get, a vector called as a fn, peek, the transient and queue reads)
+;; comes through here, and as a call it was one more frame between the caller
+;; and a vector-ref -- with three of them chained on a plain (nth v i). The
+;; dense trie descent is inline too (a 1000-element vector is one level below
+;; the root); only a relaxed (RRB) node makes a call. P and I are each
+;; evaluated once.
+(define-syntax pvec-nth-in-range
+  (syntax-rules ()
+    ((_ p0 i0)
+     (let* ((p p0) (i i0) (tail (pvec-tail p)) (tailoff (fx- (pvec-cnt p) (vector-length tail))))
+       (if (fx>=? i tailoff)
+           (vector-ref tail (fx- i tailoff))
+           (let descend ((node (pvec-root p)) (level (pvec-shift p)))
+             (cond ((fx=? level 0) (vector-ref node (fxand i 31)))
+                   ((vector? node) (descend (vector-ref node (fxand (fxsra i level) 31)) (fx- level 5)))
+                   (else (pv-trie-ref-from node level i)))))))))
+;; (pvec-ref-or p i miss): the element at I when I is a fixnum inside P's range,
+;; else MISS, evaluated only then. The in-range read every hot vector path opens
+;; with, so the fast case is one inline test and the slow case keeps each
+;; caller's own semantics (a throw, a default, a coercion).
+(define-syntax pvec-ref-or
+  (syntax-rules ()
+    ((_ p0 i0 miss)
+     (let ((p p0) (i i0))
+       (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
+           (pvec-nth-in-range p i)
+           miss)))))
+(define (pvec-nth! p i)
+  (pvec-ref-or p i
+    (if (jolt-nil? i)
+        (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" "nth index"))
+        (let ((i (if (flonum? i) (exact (fltruncate i)) i)))
+          (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
+              (pvec-nth-in-range p i)
+              (begin
+                (index-int-check! i)
+                (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "index out of bounds"))))))))
+(define (pvec-nth-d p i d)
+  (let ((i (->idx i)))
+    (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
+        (pvec-nth-in-range p i)
+        d)))
+;; get over a vector (APersistentVector.valAt): an in-range fixnum is the
+;; common key and reads directly; anything else goes through intValue.
+(define (pvec-get p k d)
+  (if (and (fixnum? k) (fx>=? k 0) (fx<? k (pvec-cnt p)))
+      (pvec-nth-in-range p k)
+      (let ((j (vec-key-index k)))
+        (if (and j (fx>=? j 0) (fx<? j (pvec-cnt p))) (pvec-nth-in-range p j) d))))
+;; A vector called as a fn, assoc'd, or assoc!'d takes an integer key by
+;; intValue and refuses any other (APersistentVector.invoke / assoc).
+(define (pvec-key-index! k)
+  (or (vec-key-index k) (throw-jvm 'IllegalArgumentException "Key must be integer")))
+;; ([:a :b] k) with a literal vector in call position (backend :coll kind)
+(define (jolt-vec-invoke1 v k) (pvec-nth! v (pvec-key-index! k)))
+;; nth's notFound arity over a vector: RT.intCast refuses the index first.
+(define (pvec-nth-cast-d p i d)
+  (let ((i (->idx i)))
+    (if (and (fixnum? i) (fx>=? i 0) (fx<? i (pvec-cnt p)))
+        (pvec-nth-in-range p i)
+        (begin (index-int-check! i) d))))
+
+;; new-path: wrap a node in single-child nodes up `level` bits.
+(define (pv-new-path level node)
+  (if (fx=? level 0) node (vector (pv-new-path (fx- level pv-bits) node))))
+;; push a full tail chunk into the trie under `parent` at `level`.
+(define (pv-push-tail cnt level parent tail-node)
+  (let ((subidx (fxand (fxsra (fx- cnt 1) level) pv-mask)))
+    (if (fx=? level pv-bits)
+        (vec-set-or-snoc parent subidx tail-node)
+        (let ((child (and (fx<? subidx (vector-length parent)) (vector-ref parent subidx))))
+          (vec-set-or-snoc parent subidx
+            (if child (pv-push-tail cnt (fx- level pv-bits) child tail-node)
+                      (pv-new-path (fx- level pv-bits) tail-node)))))))
+(define (pvec-conj p x)
+  (let ((cnt (pvec-cnt p)) (shift (pvec-shift p)))
+    (cond
+      ((fx<? (vector-length (pvec-tail p)) pv-width)
+       ;; room in the tail (classic and RRB alike)
+       (mk-pvec (fx+ cnt 1) shift (pvec-root p) (vec-snoc (pvec-tail p) x) (pv-derived-ent p)))
+      ((rrbnode? (pvec-root p))
+       ;; tail full under a relaxed root: push it down the rightmost spine
+       (let* ((tail-node (pvec-tail p))
+              (pushed (rrb-push-leaf (pvec-root p) shift tail-node)))
+         (if pushed
+             ;; rrb-mk-node gives back a plain vector when the children's
+             ;; offsets line up, though its last child may still be relaxed
+             ;; (a slice one past a trie boundary): a plain root promises a
+             ;; classic trie, so the root stays relaxed
+             (mk-pvec (fx+ cnt 1) shift (rrb-force-relaxed pushed shift) (vector x) (pv-derived-ent p))
+             (let ((trie-cnt (fx- cnt pv-width)))   ; count already in the trie
+               (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
+                        (make-rrbnode (vector trie-cnt cnt)
+                                      (vector (pvec-root p) (pv-new-path shift tail-node)))
+                        (vector x) (pv-derived-ent p))))))
+      (else
+       ;; tail full: push it into the classic trie, start a fresh tail
+       (let ((tail-node (pvec-tail p)))
+         (if (fx>? (fxsra cnt pv-bits) (fxsll 1 shift))
+             ;; root overflow: grow the trie a level
+             (mk-pvec (fx+ cnt 1) (fx+ shift pv-bits)
+                      (vector (pvec-root p) (pv-new-path shift tail-node))
+                      (vector x) (pv-derived-ent p))
+             (mk-pvec (fx+ cnt 1) shift
+                      (pv-push-tail cnt shift (pvec-root p) tail-node)
+                      (vector x) (pv-derived-ent p))))))))
+
+(define (pv-assoc-trie level node i x)
+  (cond
+    ((fx=? level 0) (vec-set node (fxand i pv-mask) x))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node)))
+       (make-rrbnode sizes
+                     (vec-set children k
+                              (pv-assoc-trie (fx- level pv-bits) (vector-ref children k) sub x)))))
+    (else
+     (let ((subidx (fxand (fxsra i level) pv-mask)))
+       (vec-set node subidx (pv-assoc-trie (fx- level pv-bits) (vector-ref node subidx) i x))))))
+(define (pvec-assoc p i x)            ; i in [0,count]; =count appends
+  (let ((i (->idx i)) (cnt (pvec-cnt p)))
+    (cond
+      ((fx=? i cnt) (pvec-conj p x))
+      ((and (fx>=? i 0) (fx<? i cnt))
+       (let ((tailoff (pv-tailoff-of p)))
+         (if (fx>=? i tailoff)
+             (mk-pvec cnt (pvec-shift p) (pvec-root p)
+                      (vec-set (pvec-tail p) (fx- i tailoff) x) (pv-derived-ent p))
+             (mk-pvec cnt (pvec-shift p)
+                      (pv-assoc-trie (pvec-shift p) (pvec-root p) i x) (pvec-tail p) (pv-derived-ent p)))))
+      (else (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "vector index out of bounds"))))))
+(define (pvec-peek p)
+  (let ((n (pvec-cnt p))) (if (fx=? n 0) jolt-nil (pvec-nth-d p (fx- n 1) jolt-nil))))
+;; pop the last trie chunk back into the tail; #f means the subtree emptied.
+(define (pv-pop-tail cnt level node)
+  (let ((subidx (fxand (fxsra (fx- cnt 2) level) pv-mask)))
+    (cond
+      ((fx>? level pv-bits)
+       (let ((newchild (pv-pop-tail cnt (fx- level pv-bits) (vector-ref node subidx))))
+         (cond ((and (not newchild) (fx=? subidx 0)) #f)
+               (newchild (vec-set node subidx newchild))
+               (else (vec-take node subidx)))))
+      ((fx=? subidx 0) #f)
+      (else (vec-take node subidx)))))
+(define (pvec-pop p)
+  (let ((cnt (pvec-cnt p)) (shift (pvec-shift p)))
+    (cond
+      ((fx=? cnt 0) (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "Can't pop empty vector")))
+      ((fx=? cnt 1) empty-pvec)
+      ((fx>? (vector-length (pvec-tail p)) 1)
+       (mk-pvec (fx- cnt 1) shift (pvec-root p) (vec-drop-last (pvec-tail p)) (pv-derived-ent p)))
+      ((rrbnode? (pvec-root p))
+       ;; relaxed trie: pop is a slice — O(log n) via the take machinery;
+       ;; re-stamp the kind the slice result should carry (slice is unstamped)
+       (pvec-with-ent (pvec-slice p 0 (fx- cnt 1)) (pv-derived-ent p)))
+      (else
+       (let* ((new-tail (pv-chunk-for p (fx- cnt 2)))
+              (popped (pv-pop-tail cnt shift (pvec-root p)))
+              (new-root (or popped pv-empty-node)))
+         (if (and (fx>? shift pv-bits) (fx<? (vector-length new-root) 2))
+             (mk-pvec (fx- cnt 1) (fx- shift pv-bits)
+                      (if (fx=? 0 (vector-length new-root)) pv-empty-node (vector-ref new-root 0))
+                      new-tail (pv-derived-ent p))
+             (mk-pvec (fx- cnt 1) shift new-root new-tail (pv-derived-ent p))))))))
+
+(define empty-pvec (mk-pvec 0 pv-bits pv-empty-node (vector) #f))
+;; build a trie pvec from a flat Scheme vector (the public constructor).
+;;
+;; Past the tail the trie is assembled BOTTOM-UP: the leaves are 32-element
+;; copies straight out of the source, each branch level groups the level below
+;; by 32, and the last 1..32 elements are the tail. That is exactly the shape
+;; conj would have produced one element at a time (dense-prefix branches, a
+;; partial last child at every level, the root growing a level per 32 children)
+;; — the transient gate pins the two equal at every boundary — but conj copied
+;; the tail on every element, so a 26k-element build allocated 5.5 MB for
+;; 210 KB of leaves and took 1 ms; this is ~12 bytes per element. vec, (apply
+;; vector …), mapv, into [] (persistent! hands its buffer here) and
+;; jolt-vector with many arguments all end in this call.
+(define (pv-build-trie v n)          ; n > pv-width -> (values root shift tail)
+  (let* ((tail-len (fx+ 1 (fxand (fx- n 1) pv-mask)))
+         (trie-n (fx- n tail-len))
+         (tail (vec-copy-range v trie-n n))
+         (nleaves (fxsra trie-n pv-bits))
+         (leaves (make-vector nleaves)))
+    (do ((i 0 (fx+ i 1))) ((fx=? i nleaves))
+      (vector-set! leaves i (vec-copy-range v (fxsll i pv-bits) (fxsll (fx+ i 1) pv-bits))))
+    (let loop ((nodes leaves) (shift pv-bits))
+      (if (fx<=? (vector-length nodes) pv-width)
+          (values nodes shift tail)
+          (let* ((m (vector-length nodes))
+                 (k (fxsra (fx+ m pv-mask) pv-bits))
+                 (parents (make-vector k)))
+            (do ((j 0 (fx+ j 1))) ((fx=? j k))
+              (vector-set! parents j
+                (vec-copy-range nodes (fxsll j pv-bits) (fxmin m (fxsll (fx+ j 1) pv-bits)))))
+            (loop parents (fx+ shift pv-bits)))))))
+(define make-pvec
+  (case-lambda
+    ((v) (make-pvec v #f))
+    ((v ent)
+     (let ((n (vector-length v)))
+       (if (fx<=? n pv-width)
+           (mk-pvec n pv-bits pv-empty-node v ent)   ; fits in the tail
+           (let-values (((root shift tail) (pv-build-trie v n)))
+             (mk-pvec n shift root tail ent)))))))
+;; materialize the trie back to a flat Scheme vector (compatibility for callers
+;; that read the backing array — all one-shot conversions, not hot loops).
+(define (pvec-v p)
+  (let* ((cnt (pvec-cnt p)) (out (make-vector cnt)))
+    (let loop ((i 0))
+      (if (fx<? i cnt)
+          (let-values (((chunk off) (pv-leaf-for p i)))
+            (let ((run (fxmin (fx- (vector-length chunk) off) (fx- cnt i))))
+              (let cloop ((j 0))
+                (if (fx<? j run)
+                    (begin (vector-set! out (fx+ i j) (vector-ref chunk (fx+ off j))) (cloop (fx+ j 1)))
+                    (loop (fx+ i run))))))
+          out))))
+;; The small arities build the backing vector directly: a vector literal with a
+;; non-constant element ([k v], [x y z]) compiles to a call here, and the
+;; variadic form paid a rest list, its length and a copy out of it for each one.
+;; No elements is the one shared empty vector, as the JVM's PersistentVector.EMPTY
+;; is: the literal [] compiles to (jolt-vector), so (identical? [] []) and
+;; (identical? [] (pop [1])) hold, as they already do for {}, #{} and ().
+(define jolt-vector
+  (case-lambda
+    (() empty-pvec)
+    ((a) (make-pvec (vector a)))
+    ((a b) (make-pvec (vector a b)))
+    ((a b c) (make-pvec (vector a b c)))
+    ((a b c d) (make-pvec (vector a b c d)))
+    (xs (make-pvec (list->vector xs)))))
+(define (make-map-entry k v) (make-pvec (vector k v) #t))
+(define (jolt-map-entry? x) (and (pvec? x) (eq? (pvec-ent x) #t)))
+;; A HOST java.util.Map$Entry (a TreeMap$Entry, an AbstractMap$SimpleImmutableEntry)
+;; as (key . value), or #f for anything else. jolt-map-entry? above stays the
+;; clojure.lang.MapEntry question; this one is what nth, conj onto a map and
+;; clojure.core/map-entry? also accept, as RT.nth and APersistentMap.cons accept
+;; any Map.Entry. The java layer (java/jutil-colls.ss) set!s it.
+(define jolt-host-entry (lambda (x) #f))
+(define (jolt-subvec-view? x) (and (pvec? x) (eq? (pvec-ent x) (quote subvec))))
+
+;; ============================================================================
+;; RRB concat / slice — O(log n) pvec-catvec and pvec-slice
+;;
+;; The concat/rebalance plan, size-table search, and take/drop node surgery are
+;; ported from Racket's treelist (racket/collects/racket/treelist.rkt),
+;; Copyright (c) PLT Design Inc. and contributors, used under the MIT License
+;; (licenses/MIT-racket.txt), adapted to this file's node shapes: leaves are element chunks,
+;; regular branches are Scheme vectors, relaxed branches are rrbnode records,
+;; and the vector keeps Clojure's tail (treelist has none; the tail seam
+;; follows clojure/core.rrb-vector, with L'orange's RRB thesis arbitrating).
+;; Levels are in SHIFT BITS like the rest of this file: leaves at 0, a node's
+;; children one pv-bits step down.
+;; ============================================================================
+
+;; children of a slot, viewing a leaf as a chunk of "children" (its elements)
+(define (rrb-slot-children n) (if (rrbnode? n) (rrbnode-children n) n))
+(define (rrb-nslots n) (vector-length (rrb-slot-children n)))
+(define (rrb-first-child n) (vector-ref (rrb-slot-children n) 0))
+(define (rrb-last-child n)
+  (let ((cs (rrb-slot-children n))) (vector-ref cs (fx- (vector-length cs) 1))))
+
+(define (vec-append a b)
+  (let* ((na (vector-length a)) (nb (vector-length b)) (out (make-vector (fx+ na nb))))
+    (let loop ((i 0)) (when (fx<? i na) (vector-set! out i (vector-ref a i)) (loop (fx+ i 1))))
+    (let loop ((i 0)) (when (fx<? i nb) (vector-set! out (fx+ na i) (vector-ref b i)) (loop (fx+ i 1))))
+    out))
+(define (vec-drop-first v) (vec-copy-range v 1 (vector-length v)))
+
+;; elements in a subtree
+(define (rrb-subtree-count node level)
+  (cond
+    ((fx=? level 0) (vector-length node))
+    ((rrbnode? node)
+     (let ((sizes (rrbnode-sizes node))) (vector-ref sizes (fx- (vector-length sizes) 1))))
+    (else
+     ;; leftwise dense: all but the last child are full for their level
+     (fx+ (fxsll (fx- (vector-length node) 1) level)
+          (rrb-subtree-count (rrb-last-child node) (fx- level pv-bits))))))
+
+;; build a branch at `level` from a children vector: leftwise-dense children
+;; stay a plain radix-addressed vector, anything else gets a size table.
+(define (rrb-mk-node children level)
+  (if (fx=? level 0)
+      children
+      (let* ((n (vector-length children))
+             (sizes (make-vector n))
+             (mask (fx- (fxsll 1 level) 1)))
+        (let loop ((i 0) (sum 0) (dense? #t))
+          (if (fx<? i n)
+              (let ((new-sum (fx+ sum (rrb-subtree-count (vector-ref children i) (fx- level pv-bits)))))
+                (vector-set! sizes i new-sum)
+                (loop (fx+ i 1) new-sum (and dense? (fx=? 0 (fxand sum mask)))))
+              (if dense? children (make-rrbnode sizes children)))))))
+
+;; push a full 32-wide tail leaf down the rightmost spine of a relaxed trie;
+;; #f when every node on the spine is full (caller grows the root).
+(define (rrb-push-leaf node level leaf)
+  (cond
+    ((fx=? level pv-bits)
+     (if (fx<? (rrb-nslots node) pv-width)
+         (rrb-mk-node (vec-snoc (rrb-slot-children node) leaf) level)
+         #f))
+    (else
+     (let* ((cs (rrb-slot-children node)) (n (vector-length cs))
+            (pushed (and (fx>? n 0)
+                         (rrb-push-leaf (vector-ref cs (fx- n 1)) (fx- level pv-bits) leaf))))
+       (cond
+         (pushed (rrb-mk-node (vec-set cs (fx- n 1) pushed) level))
+         ((fx<? n pv-width)
+          (rrb-mk-node (vec-snoc cs (pv-new-path (fx- level pv-bits) leaf)) level))
+         (else #f))))))
+
+;; --- concat ------------------------------------------------------------------
+(define (rrb-merge-nodes left center-slots right)
+  (vec-append (if left (vec-drop-last (rrb-slot-children left)) (vector))
+              (vec-append center-slots
+                          (if right (vec-drop-first (rrb-slot-children right)) (vector)))))
+
+;; redistribution plan over slots that temporarily exceed 32 children:
+;; #f when already within ceil(count/32)+2 slots (the RRB search-step bound).
+(define (rrb-concat-plan slots)
+  (let* ((n (vector-length slots))
+         (plan (make-vector n))
+         (child-count (let loop ((i 0) (c 0))
+                        (if (fx<? i n)
+                            (let ((sz (rrb-nslots (vector-ref slots i))))
+                              (vector-set! plan i sz)
+                              (loop (fx+ i 1) (fx+ c sz)))
+                            c)))
+         (optimal (fxquotient (fx+ child-count pv-width -1) pv-width))
+         (target (fx+ optimal 2)))
+    (if (fx>=? target n) #f (rrb-distribute plan target n))))
+
+(define (rrb-distribute plan target count)
+  (let loop ((count count) (node-idx 0))
+    (if (fx>=? target count)
+        (vec-take plan count)
+        (let* ((init-i (let short ((i node-idx))
+                         (if (fx<? (vector-ref plan i) (fx- pv-width 1)) i (short (fx+ i 1)))))
+               (i (let dist ((i init-i) (r (vector-ref plan init-i)))
+                    (if (fx=? r 0)
+                        i
+                        (let ((min-size (fxmin (fx+ r (vector-ref plan (fx+ i 1))) pv-width)))
+                          (vector-set! plan i min-size)
+                          (dist (fx+ i 1)
+                                (fx- (fx+ r (vector-ref plan (fx+ i 1))) min-size)))))))
+          ;; one slot was absorbed: close the gap
+          (let move ((j i))
+            (when (fx<? j (fx- count 1))
+              (vector-set! plan j (vector-ref plan (fx+ j 1))) (move (fx+ j 1))))
+          (loop (fx- count 1) (fxmax 0 (fx- i 1)))))))
+
+(define (rrb-exec-plan slots plan sl)     ; sl = the slots' own level
+  (if (not plan)
+      slots
+      (let* ((ns (vector-length slots))
+             (flat-size (let loop ((i 0) (s 0))
+                          (if (fx<? i ns) (loop (fx+ i 1) (fx+ s (rrb-nslots (vector-ref slots i)))) s)))
+             (flat (make-vector flat-size)))
+        (let fill ((i 0) (k 0))
+          (when (fx<? i ns)
+            (let* ((cs (rrb-slot-children (vector-ref slots i))) (n (vector-length cs)))
+              (let cp ((j 0)) (when (fx<? j n) (vector-set! flat (fx+ k j) (vector-ref cs j)) (cp (fx+ j 1))))
+              (fill (fx+ i 1) (fx+ k n)))))
+        (let* ((np (vector-length plan)) (out (make-vector np)))
+          (let build ((i 0) (sum 0))
+            (if (fx<? i np)
+                (let ((w (vector-ref plan i)))
+                  (vector-set! out i (rrb-mk-node (vec-copy-range flat sum (fx+ sum w)) sl))
+                  (build (fx+ i 1) (fx+ sum w)))
+                out))))))
+
+;; merge `left`'s children (but its last), `center`'s, and `right`'s (but its
+;; first) into <=32-slot nodes; -> (values node level), growing a level when
+;; the redistributed slots still exceed one node.
+(define (rrb-rebalance left center right level level-c)
+  (let* ((sl (fx- level pv-bits))
+         (center-slots (if (fx<? level-c level) (vector center) (rrb-slot-children center)))
+         (all-slots (rrb-merge-nodes left center-slots right))
+         (plan (rrb-concat-plan all-slots))
+         (slots (rrb-exec-plan all-slots plan sl)))
+    (if (fx<=? (vector-length slots) pv-width)
+        (values (rrb-mk-node slots level) level)
+        (let ((nl (vec-take slots pv-width))
+              (nr (vec-copy-range slots pv-width (vector-length slots))))
+          (values (rrb-mk-node (vector (rrb-mk-node nl level) (rrb-mk-node nr level))
+                               (fx+ level pv-bits))
+                  (fx+ level pv-bits))))))
+
+;; concatenate two subtrees; -> (values node level)
+(define (rrb-concat-subtree left ls right rs)
+  (cond
+    ((fx>? ls rs)
+     (let-values (((mid ml) (rrb-concat-subtree (rrb-last-child left) (fx- ls pv-bits) right rs)))
+       (rrb-rebalance left mid #f ls ml)))
+    ((fx<? ls rs)
+     (let-values (((mid ml) (rrb-concat-subtree left ls (rrb-first-child right) (fx- rs pv-bits))))
+       (rrb-rebalance #f mid right rs ml)))
+    ((fx=? ls 0)
+     (if (fx<=? (fx+ (vector-length left) (vector-length right)) pv-width)
+         (values (vec-append left right) 0)
+         (values (rrb-mk-node (vector left right) pv-bits) pv-bits)))
+    (else
+     (let-values (((mid ml) (rrb-concat-subtree (rrb-last-child left) (fx- ls pv-bits)
+                                                (rrb-first-child right) (fx- rs pv-bits))))
+       (rrb-rebalance left mid right ls ml)))))
+
+;; --- take / drop -------------------------------------------------------------
+;; keep elements [0, i] of the subtree (i relative, inclusive)
+(define (rrb-take-node node level i)
+  (cond
+    ((fx=? level 0) (vec-take node (fx+ (fxand i pv-mask) 1)))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node))
+            (new-child (rrb-take-node (vector-ref children k) (fx- level pv-bits) sub))
+            (new-children (vec-take children (fx+ k 1))))
+       (vector-set! new-children k new-child)
+       (if (fx=? (vector-length new-children) 1)
+           new-children                       ; a single child radix-addresses as slot 0
+           (let ((new-sizes (vec-take sizes (fx+ k 1))))
+             (vector-set! new-sizes k (fx+ i 1))
+             (make-rrbnode new-sizes new-children)))))
+    (else
+     (let* ((k (fxand (fxsra i level) pv-mask))
+            (new-child (rrb-take-node (vector-ref node k) (fx- level pv-bits) i))
+            (new-children (vec-take node (fx+ k 1))))
+       (vector-set! new-children k new-child)
+       new-children))))                       ; prefix children untouched => stays leftwise dense
+
+;; drop the first i elements of the subtree (i relative)
+(define (rrb-drop-node node level i)
+  (cond
+    ((fx=? level 0) (vec-copy-range node (fxand i pv-mask) (vector-length node)))
+    ((rrbnode? node)
+     (let* ((i (fxand i (fx- (fxsll 1 (fx+ level pv-bits)) 1)))   ; see pv-leaf-for
+            (sizes (rrbnode-sizes node))
+            (k (rrb-find-child sizes i))
+            (sub (if (fx=? k 0) i (fx- i (vector-ref sizes (fx- k 1)))))
+            (children (rrbnode-children node))
+            (new-child (rrb-drop-node (vector-ref children k) (fx- level pv-bits) sub))
+            (new-children (vec-copy-range children k (vector-length children))))
+       (vector-set! new-children 0 new-child)
+       (if (fx=? (vector-length new-children) 1)
+           new-children
+           (let* ((old-len (vector-length sizes))
+                  (new-len (fx- old-len k))
+                  (new-sizes (make-vector new-len)))
+             (let loop ((j 0))
+               (when (fx<? j new-len)
+                 (vector-set! new-sizes j (fx- (vector-ref sizes (fx+ k j)) i))
+                 (loop (fx+ j 1))))
+             (make-rrbnode new-sizes new-children)))))
+    (else
+     (let* ((k (fxand (fxsra i level) pv-mask))
+            (new-child (rrb-drop-node (vector-ref node k) (fx- level pv-bits) i))
+            (new-children (vec-copy-range node k (vector-length node)))
+            (new-len (vector-length new-children)))
+       (vector-set! new-children 0 new-child)
+       (if (fx=? new-len 1)
+           new-children
+           (let ((size0 (rrb-subtree-count new-child (fx- level pv-bits)))
+                 (step (fxsll 1 level)))
+             (if (fx=? size0 step)
+                 new-children                 ; dropped whole subtrees: still leftwise dense
+                 (let ((new-sizes (make-vector new-len)))
+                   (let loop ((j 0))
+                     (when (fx<? j (fx- new-len 1))
+                       (vector-set! new-sizes j (fx+ size0 (fx* j step)))
+                       (loop (fx+ j 1))))
+                   (vector-set! new-sizes (fx- new-len 1)
+                                (fx+ size0 (fx* (fx- new-len 2) step)
+                                     (rrb-subtree-count (vector-ref new-children (fx- new-len 1))
+                                                        (fx- level pv-bits))))
+                   (make-rrbnode new-sizes new-children)))))))))
+
+;; collapse single-child levels; -> (values node level)
+(define (rrb-squash node level)
+  (if (and (fx>? level 0) (fx=? (rrb-nslots node) 1))
+      (rrb-squash (rrb-first-child node) (fx- level pv-bits))
+      (values node level)))
+
+;; --- pvec boundary -----------------------------------------------------------
+;; the whole vector (tail folded in) as one subtree; -> (values root level)
+(define (pvec->rrb-tree p)
+  (let ((tail (pvec-tail p)) (tailoff (pv-tailoff-of p)))
+    (cond
+      ((fx=? tailoff 0) (values tail 0))
+      ((fx=? (vector-length tail) 0) (values (pvec-root p) (pvec-shift p)))
+      (else (rrb-concat-subtree (pvec-root p) (pvec-shift p) tail 0)))))
+
+;; is this subtree a full classic trie (32-aligned count, plain rightmost
+;; spine)? Plain multi-child nodes are leftwise dense by construction, so a
+;; plain spine + aligned total means every leaf is full and radix-addressed.
+(define (rrb-classic-tree? node level cnt)
+  (and (fx=? 0 (fxand cnt pv-mask))
+       (let spine ((n node) (l level))
+         (cond ((fx=? l 0) #t)
+               ((rrbnode? n) #f)
+               (else (spine (rrb-last-child n) (fx- l pv-bits)))))))
+
+;; classic emission: pull the rightmost leaf back out as the tail so every
+;; classic invariant (tail 1..32, aligned tailoff, full leaves) holds.
+(define (rrb-tree->classic-pvec root level cnt)
+  (let* ((new-tail (let last ((n root) (l level))
+                     (if (fx=? l 0) n (last (rrb-last-child n) (fx- l pv-bits)))))
+         (popped (pv-pop-tail cnt level root))
+         (new-root (or popped pv-empty-node)))
+    (if (and (fx>? level pv-bits) (fx<? (vector-length new-root) 2))
+        (mk-pvec cnt (fx- level pv-bits)
+                 (if (fx=? 0 (vector-length new-root)) pv-empty-node (vector-ref new-root 0))
+                 new-tail #f)
+        (mk-pvec cnt level new-root new-tail #f))))
+
+;; force a size table onto a plain (leftwise-dense) root: a plain-rooted pvec
+;; promises the FULL classic invariants, which a partial last leaf breaks.
+(define (rrb-force-relaxed root level)
+  (if (rrbnode? root)
+      root
+      (let* ((n (vector-length root)) (sizes (make-vector n)))
+        (let loop ((i 0) (sum 0))
+          (if (fx<? i n)
+              (let ((s (fx+ sum (rrb-subtree-count (vector-ref root i) (fx- level pv-bits)))))
+                (vector-set! sizes i s) (loop (fx+ i 1) s))
+              (make-rrbnode sizes root))))))
+
+(define (rrb-tree->pvec root level cnt)
+  (cond
+    ((fx=? cnt 0) empty-pvec)
+    ((fx=? level 0) (mk-pvec cnt pv-bits pv-empty-node root #f))   ; bare leaf: tail-only
+    ((rrb-classic-tree? root level cnt) (rrb-tree->classic-pvec root level cnt))
+    (else (mk-pvec cnt level (rrb-force-relaxed root level) (vector) #f))))
+
+;; --- public entry points -----------------------------------------------------
+(define (pvec-copy-into! out at p)
+  (let ((cnt (pvec-cnt p)))
+    (let loop ((i 0))
+      (when (fx<? i cnt)
+        (let-values (((chunk off) (pv-leaf-for p i)))
+          (let ((run (fxmin (fx- (vector-length chunk) off) (fx- cnt i))))
+            (sa-vector-copy-range! out (fx+ at i) chunk off (fx+ off run))
+            (loop (fx+ i run))))))))
+
+;; O(log n) structural concatenation
+(define (pvec-catvec a b)
+  (let ((ca (pvec-cnt a)) (cb (pvec-cnt b)))
+    (cond
+      ((fx=? ca 0) b)
+      ((fx=? cb 0) a)
+      ((fx<=? (fx+ ca cb) pv-width)
+       (let ((out (make-vector (fx+ ca cb))))
+         (pvec-copy-into! out 0 a)
+         (pvec-copy-into! out ca b)
+         (mk-pvec (fx+ ca cb) pv-bits pv-empty-node out #f)))
+      (else
+       (let*-values (((ra la) (pvec->rrb-tree a))
+                     ((rb lb) (pvec->rrb-tree b))
+                     ((root level) (rrb-concat-subtree ra la rb lb)))
+         (rrb-tree->pvec root level (fx+ ca cb)))))))
+
+;; O(log n) structural slice [start, end)
+(define (pvec-slice p start end)
+  (let ((start (->idx start)) (end (->idx end)) (cnt (pvec-cnt p)))
+    (cond
+      ((or (not (fixnum? start)) (not (fixnum? end))
+           (fx<? start 0) (fx>? end cnt) (fx>? start end))
+       (jolt-throw (jolt-host-throwable "java.lang.IndexOutOfBoundsException" "slice index out of bounds")))
+      ((and (fx=? start 0) (fx=? end cnt)) p)
+      ((fx=? start end) empty-pvec)
+      ((fx<=? (fx- end start) pv-width)
+       ;; small windows flatten to a tail-only classic vector
+       (let* ((n (fx- end start)) (out (make-vector n)))
+         (let loop ((i start))
+           (when (fx<? i end)
+             (let-values (((chunk off) (pv-leaf-for p i)))
+               (let ((run (fxmin (fx- (vector-length chunk) off) (fx- end i))))
+                 (let cp ((j 0))
+                   (when (fx<? j run)
+                     (vector-set! out (fx+ (fx- i start) j) (vector-ref chunk (fx+ off j)))
+                     (cp (fx+ j 1))))
+                 (loop (fx+ i run))))))
+         (mk-pvec n pv-bits pv-empty-node out #f)))
+      (else
+       (let-values (((root level) (pvec->rrb-tree p)))
+         (let*-values (((root level) (if (fx=? end cnt)
+                                         (values root level)
+                                         (let ((r (rrb-take-node root level (fx- end 1))))
+                                           (rrb-squash r level))))
+                       ((root level) (if (fx=? start 0)
+                                         (values root level)
+                                         (let ((r (rrb-drop-node root level start)))
+                                           (rrb-squash r level)))))
+           (rrb-tree->pvec root level (fx- end start))))))))
+
+;; ============================================================================
+;; bitmap HAMT — keys hashed by jolt-hash, leaves compared by jolt=
+;;   arr slot is one of: leaf (cons k v) | hnode (branch) | hcoll (hash bucket)
+;; ============================================================================
+(define-record-type hnode (fields bm arr) (nongenerative chez-hnode-v1))
+(define-record-type hcoll (fields hash alist) (nongenerative chez-hcoll-v1))
+(define empty-hnode (make-hnode 0 (vector)))
+(define hmask #xFFFFFFFF)                ; 32-bit unsigned hash window (JVM int range)
+(define max-shift 30)                     ; 7 levels × 5 bits = 35 > 32; last level shift 30
+
+;; A hash and a node bitmap each span all 32 bits, so on a 32-bit Chez (tpb32l)
+;; they are bignums, not fixnums — see hasheq.ss's define-width-op for the width
+;; invariant and why the arm is chosen at expand time. These are the SAFE fx
+;; forms on the wide path, as they have always been: the bitmap arithmetic is
+;; not the measured inner chain the hash engine's #3% forms were tuned for, and
+;; a checked op here fails loudly rather than corrupting a node.
+(define-width-op hamt=?       fx=?        =)
+(define-width-op hamt-sub     fx-         -)
+(define-width-op hamt-and     fxand       bitwise-and)
+(define-width-op hamt-ior     fxior       bitwise-ior)
+(define-width-op hamt-not     fxnot       bitwise-not)
+(define-width-op hamt-sll     fxsll       bitwise-arithmetic-shift-left)
+(define-width-op hamt-sra     fxsra       bitwise-arithmetic-shift-right)
+(define-width-op hamt-popcount fxbit-count bitwise-bit-count)
+
+;; The runtime fixnum? test stays, on both arms: an extension type can return a
+;; bignum here via equal-hash whatever the machine's width is, and that case has
+;; to reach bitwise-and even on a 64-bit build. hamt-and covers the other half —
+;; on a 32-bit machine an ORDINARY int hash is a bignum too, so the test is not
+;; the only thing keeping fxand off a non-fixnum there.
+(define (key-hash k)
+  (if (fixnum? k)
+      (murmur3-hash-fixnum-u32 k)
+      (let ((h (jolt-hasheq k)))
+        (if (fixnum? h) (hamt-and h hmask) (bitwise-and h hmask)))))
+;; Macros: every level of every lookup, insert and removal runs all four, and
+;; as procedures they were four out-of-line calls a level -- most of a set
+;; lookup's cost once the key is hashed (a cache-resident two-level lookup took
+;; 37 ns).
+(define-syntax hamt-chunk
+  (syntax-rules () ((_ h shift) (hamt-and (hamt-sra h shift) 31))))
+(define-syntax hamt-bitpos
+  (syntax-rules () ((_ h shift) (hamt-sll 1 (hamt-chunk h shift)))))
+(define-syntax hamt-arr-index
+  (syntax-rules () ((_ bm bit) (hamt-popcount (hamt-and bm (hamt-sub bit 1))))))
+(define (chunk h shift) (hamt-chunk h shift))
+
+;; jolt= alist ops (for hash-collision buckets)
+(define (assoc-by same? k al)
+  (cond ((null? al) #f)
+        ((same? (caar al) k) (car al))
+        (else (assoc-by same? k (cdr al)))))
+(define (assoc-jolt k al) (assoc-by jolt=2 k al))
+;; Replacing a key's value KEEPS the key already stored, dropping the equal one
+;; assoc was handed (JVM PersistentHashMap.assoc only clones the value slot). The
+;; two are jolt=, but only the stored one carries the metadata that seq/keys/find
+;; hand back.
+(define (alist-replace entry v al)
+  (if (eq? (car al) entry) (cons (cons (car entry) v) (cdr al))
+      (cons (car al) (alist-replace entry v (cdr al)))))
+(define (alist-remove entry al)
+  (if (eq? (car al) entry) (cdr al)
+      (cons (car al) (alist-remove entry (cdr al)))))
+
+;; split two leaves that collided at `shift` into a subtree (or hcoll if the
+;; full hashes are equal / the hash is exhausted).
+(define (split-leaf shift ek ev h k v)
+  (split-hashed-leaves shift (key-hash ek) ek ev h k v))
+(define (split-hashed-leaves shift eh ek ev h k v)
+  (if (or (fx>? shift max-shift) (hamt=? eh h))
+      (make-hcoll h (list (cons ek ev) (cons k v)))
+      (let ((ei (hamt-chunk eh shift)) (ni (hamt-chunk h shift)))
+        (if (fx=? ei ni)
+            (make-hnode (hamt-sll 1 ei) (vector (split-hashed-leaves (fx+ shift 5) eh ek ev h k v)))
+            (let ((eb (hamt-sll 1 ei)) (nb (hamt-sll 1 ni)))
+              (if (fx<? ei ni)
+                  (make-hnode (hamt-ior eb nb) (vector (cons ek ev) (cons k v)))
+                  (make-hnode (hamt-ior eb nb) (vector (cons k v) (cons ek ev)))))))))
+
+;; Answers the node ITSELF when the key is present with that very value — the
+;; reference's `if(val == valOrNode) return this` — so pmap-assoc can hand the
+;; caller's map back untouched (the eq? test at the root), the way both
+;; PersistentArrayMap.assoc and PersistentHashMap.assoc do.
+(define (node-assoc node shift h k v added)
+  (node-assoc-by node shift h k v added jolt=2 key-hash))
+(define (node-assoc-by node shift h k v added same? stored-hash)
+  (let* ((bit (hamt-bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
+    (if (hamt=? 0 (hamt-and bm bit))
+        (begin (set-box! added #t)
+               (make-hnode (hamt-ior bm bit) (vec-insert arr (hamt-arr-index bm bit) (cons k v))))
+        (let* ((i (hamt-arr-index bm bit)) (child (vector-ref arr i)))
+          (cond
+            ((hnode? child)
+             (let ((nc (node-assoc-by child (fx+ shift 5) h k v added same? stored-hash)))
+               (if (eq? nc child) node (make-hnode bm (vec-set arr i nc)))))
+            ((hcoll? child)
+             (let* ((al (hcoll-alist child)) (p (assoc-by same? k al)))
+               (cond ((not p)
+                      (set-box! added #t)
+                      (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (append al (list (cons k v)))))))
+                     ((eq? (cdr p) v) node)
+                     (else (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) (alist-replace p v al))))))))
+            ;; replace: the leaf keeps ITS key, not the equal one handed in
+            ((same? (car child) k)
+             (if (eq? (cdr child) v) node (make-hnode bm (vec-set arr i (cons (car child) v)))))
+            (else (set-box! added #t)
+                  (let ((sub (split-hashed-leaves (fx+ shift 5) (stored-hash (car child))
+                                                  (car child) (cdr child) h k v)))
+                    (make-hnode bm (vec-set arr i sub)))))))))
+
+(define (node-get node shift h k default)
+  (let* ((bit (hamt-bitpos h shift)) (bm (hnode-bm node)))
+    (if (hamt=? 0 (hamt-and bm bit)) default
+        (let ((child (vector-ref (hnode-arr node) (hamt-arr-index bm bit))))
+          (cond ((hnode? child) (node-get child (fx+ shift 5) h k default))
+                ((hcoll? child) (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) default)))
+                ((jolt= (car child) k) (cdr child))
+                (else default))))))
+
+;; node-get, but answering with the whole stored (key . value) pair — #f when the
+;; key is absent. The pair's car is the key the map HOLDS, which is what `find`
+;; must put in its entry (see pmap-entry-at).
+(define (node-entry node shift h k)
+  (let* ((bit (hamt-bitpos h shift)) (bm (hnode-bm node)))
+    (if (hamt=? 0 (hamt-and bm bit)) #f
+        (let ((child (vector-ref (hnode-arr node) (hamt-arr-index bm bit))))
+          (cond ((hnode? child) (node-entry child (fx+ shift 5) h k))
+                ((hcoll? child) (assoc-jolt k (hcoll-alist child)))
+                ((jolt= (car child) k) child)
+                (else #f))))))
+
+(define (node-dissoc node shift h k removed)
+  (node-dissoc-by node shift h k removed jolt=2))
+(define (node-dissoc-by node shift h k removed same?)
+  (let* ((bit (hamt-bitpos h shift)) (bm (hnode-bm node)) (arr (hnode-arr node)))
+    (if (hamt=? 0 (hamt-and bm bit)) node
+        (let* ((i (hamt-arr-index bm bit)) (child (vector-ref arr i)))
+          (cond
+            ;; A child the removal empties is dropped from this node, as the
+            ;; reference's BitmapIndexedNode.without drops a null child. Left in
+            ;; place, emptied branches pile up at the front of a map drained in
+            ;; iteration order, and every later seq/first has to step over them.
+            ((hnode? child)
+             (let ((nc (node-dissoc-by child (fx+ shift 5) h k removed same?)))
+               (cond ((eq? nc child) node)
+                     ((hamt=? 0 (hnode-bm nc)) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
+                     (else (make-hnode bm (vec-set arr i nc))))))
+            ((hcoll? child)
+             (let ((entry (assoc-by same? k (hcoll-alist child))))
+               (if (not entry) node
+                   (let ((nal (alist-remove entry (hcoll-alist child))))
+                     (set-box! removed #t)
+                     (cond ((null? nal) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
+                           ((null? (cdr nal)) (make-hnode bm (vec-set arr i (car nal)))) ; collapse to leaf
+                           (else (make-hnode bm (vec-set arr i (make-hcoll (hcoll-hash child) nal)))))))))
+            ((same? (car child) k)
+             (set-box! removed #t) (make-hnode (hamt-and bm (hamt-not bit)) (vec-remove arr i)))
+            (else node))))))
+
+(define (node-fold node proc acc)     ; (proc k v acc) over every leaf, JVM (ascending) order
+  (let ((arr (hnode-arr node)))
+    (let loop ((i (fx- (vector-length arr) 1)) (acc acc))
+      (if (fx<? i 0)
+          acc
+          (let ((child (vector-ref arr i)))
+            (loop (fx- i 1)
+                  (cond ((hnode? child) (node-fold child proc acc))
+                        ((hcoll? child)
+                         (let cl ((al (hcoll-alist child)) (a acc))
+                           (if (null? al) a (cl (cdr al) (proc (caar al) (cdar al) a)))))
+                        (else (proc (car child) (cdr child) acc)))))))))
+;; node-fold's visit, reversed: (proc k v acc) over every leaf in the order a
+;; seq over the map yields them. node-fold walks the trie from the high end so a
+;; consing caller ends up with an ascending list; a caller building a value
+;; directly (pmap-fold-fwd) needs the ascending walk itself, or (into {} m) of a
+;; hash map lands its entries in reverse.
+(define (node-fold-fwd node proc acc)
+  (let* ((arr (hnode-arr node)) (n (vector-length arr)))
+    (let loop ((i 0) (acc acc))
+      (if (fx=? i n)
+          acc
+          (let ((child (vector-ref arr i)))
+            (loop (fx+ i 1)
+                  (cond ((hnode? child) (node-fold-fwd child proc acc))
+                        ((hcoll? child)
+                         (fold-left (lambda (a p) (proc (car p) (cdr p) a))
+                                    acc (reverse (hcoll-alist child))))
+                        (else (proc (car child) (cdr child) acc)))))))))
+
+;; ============================================================================
+;; editable HAMT nodes — reachable only from a live transient
+;; ============================================================================
+;; A transient claims a node by copying it into an `enode` and then writes into
+;; that copy in place, so building through a transient stops path-copying the
+;; trie per entry.
+;;
+;; PersistentHashMap.java does this by giving every node an edit token and
+;; mutating when the token matches. jolt cannot: `hnode`'s layout is
+;; image-format surface. state-image.ss keeps a CLEAN pmap by pointer and only
+;; rebuilds it when a key or value had to be substituted, so an ordinary map's
+;; whole node tree is fasl-written raw — a dumped map's bytes contain
+;; `chez-hnode-v1`. Adding a field to it stops released images restoring.
+;;
+;; So the editable node is a separate type, and "is this node mine?" is just
+;; `enode?` — no token needed. That is a stronger guarantee than the JVM's: an
+;; enode is only ever reachable from the transient that created it (claiming
+;; COPIES, and persistent! freezes every enode back into an hnode), so two
+;; transients can never share one. The immutable node functions above therefore
+;; never see an enode, and nothing on the persistent map path changes.
+;;
+;; Editable nodes have one slot per five-bit hash fragment. A free slot holds
+;; #f. Every child is a node, a collision bucket or a (key . value) pair,
+;; including entries with false or nil keys and values. The bitmap is kept
+;; for the compact persistent node produced at freeze.
+(define-record-type enode (fields (mutable bm) arr) (nongenerative chez-enode-v2))
+(define enode-width 32)
+
+(define (enode-empty) (make-enode 0 (make-vector enode-width #f)))
+
+;; With low = bits - 1, (low & ~bits) has a one in every position
+;; below the lowest occupied slot. Its population count is that slot's index.
+;; (bits & low) then clears the slot for the next iteration.
+(define-syntax hamt-lowest-slot
+  (syntax-rules () ((_ bits low) (hamt-popcount (hamt-and low (hamt-not bits))))))
+
+;; Expand the source's packed children into their hash slots. Only this
+;; node's array is copied. Its children remain shared until the next write.
+(define (hnode->enode nd)
+  (let ((bm (hnode-bm nd)) (src (hnode-arr nd)) (out (make-vector enode-width #f)))
+    (let loop ((bits bm) (j 0))
+      (unless (hamt=? 0 bits)
+        (let ((below (hamt-sub bits 1)))
+          (vector-set! out (hamt-lowest-slot bits below) (vector-ref src j))
+          (loop (hamt-and bits below) (fx+ j 1)))))
+    (make-enode bm out)))
+(define (enode-claim nd) (if (enode? nd) nd (hnode->enode nd)))
+
+;; The caller owns nd. Return #t when this write adds a key.
+(define (enode-assoc! nd shift h k v)
+  (let* ((i (hamt-chunk h shift)) (arr (enode-arr nd)) (child (vector-ref arr i)))
+    (cond
+      ((not child)
+       (vector-set! arr i (cons k v))
+       (enode-bm-set! nd (hamt-ior (enode-bm nd) (hamt-sll 1 i)))
+       #t)
+      ((enode? child) (enode-assoc! child (fx+ shift 5) h k v))
+      ((hnode? child)
+       (let ((c (hnode->enode child)))
+         (vector-set! arr i c)
+         (enode-assoc! c (fx+ shift 5) h k v)))
+      ;; collisions are rare, so the bucket stays immutable and is replaced
+      ((hcoll? child)
+       (let* ((al (hcoll-alist child)) (existing (assoc-jolt k al)))
+         (vector-set! arr i
+           (make-hcoll (hcoll-hash child)
+             (if existing (alist-replace existing v al) (append al (list (cons k v))))))
+         (not existing)))
+      ;; The leaf may be shared with the source. Preserve its stored key.
+      ((jolt= (car child) k) (vector-set! arr i (cons (car child) v)) #f)
+      (else
+       (vector-set! arr i (split-leaf (fx+ shift 5) (car child) (cdr child) h k v))
+       #t))))
+
+;; Mirrors node-dissoc, including dropping an interior node the removal empties.
+(define (enode-dissoc! nd shift h k removed)
+  (let* ((i (hamt-chunk h shift)) (arr (enode-arr nd)) (child (vector-ref arr i)))
+    (define (drop-slot!)
+      (vector-set! arr i #f)
+      (enode-bm-set! nd (hamt-and (enode-bm nd) (hamt-not (hamt-sll 1 i)))))
+    (cond
+      ((not child) #f)
+      ((or (enode? child) (hnode? child))
+       (let ((c (enode-claim child)))
+         (vector-set! arr i c)
+         (enode-dissoc! c (fx+ shift 5) h k removed)
+         (when (hamt=? 0 (enode-bm c)) (drop-slot!))))
+      ((hcoll? child)
+       (let ((entry (assoc-jolt k (hcoll-alist child))))
+         (when entry
+           (set-box! removed #t)
+           (let ((al (alist-remove entry (hcoll-alist child))))
+             (cond ((null? al) (drop-slot!))
+                   ((null? (cdr al)) (vector-set! arr i (car al)))
+                   (else (vector-set! arr i (make-hcoll (hcoll-hash child) al))))))))
+      ((jolt= (car child) k) (set-box! removed #t) (drop-slot!)))))
+
+;; Reads work over a MIXED tree: the part the transient has written to is
+;; enodes, everything else is still the source map's hnodes. This is on the hot
+;; path for read-heavy transient code (group-by does one get per element), so
+;; the cases are ordered by frequency rather than by kind: a leaf is a pair and
+;; nothing else here is, so one `pair?` settles the common case, and an
+;; unclaimed subtree hands off to node-get, which carries no enode tests at all.
+(define (enode-get nd shift h k default)
+  (if (enode? nd)
+      (let ((child (vector-ref (enode-arr nd) (hamt-chunk h shift))))
+        (cond ((pair? child) (if (jolt= (car child) k) (cdr child) default))
+              ((not child) default)
+              ((enode? child) (enode-get child (fx+ shift 5) h k default))
+              ((hcoll? child) (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) default)))
+              (else (node-get child (fx+ shift 5) h k default))))
+      (node-get nd shift h k default)))
+
+;; Freeze an edited tree: every enode becomes an hnode whose array is trimmed to
+;; exactly its used slots. An hnode subtree was never claimed, so it is already
+;; immutable and is kept BY POINTER — that is the structural sharing with the
+;; map the transient started from. Cost is O(claimed nodes), not O(entries).
+(define (enode-freeze nd)
+  (if (enode? nd)
+      (let* ((bm (enode-bm nd)) (used (hamt-popcount bm))
+             (arr (enode-arr nd)) (out (make-vector used)))
+        (let loop ((bits bm) (j 0))
+          (if (hamt=? 0 bits)
+              (make-hnode bm out)
+              (let* ((below (hamt-sub bits 1)) (slot (hamt-lowest-slot bits below)))
+                (vector-set! out j (enode-freeze (vector-ref arr slot)))
+                (loop (hamt-and bits below) (fx+ j 1))))))
+      nd))
+
+;; ============================================================================
+;; persistent map / set over the HAMT
+;; ============================================================================
+;; A map is one of two representations behind one record type, told apart by
+;; its root — an hnode is the trie, anything else the slot vector (the test is
+;; hnode?, never vector?: a target may represent records as vectors):
+;;
+;;   ARRAY mode — root is a Scheme vector of alternating key/value slots
+;;     #(k0 v0 k1 v1 ...) in INSERTION order (Clojure's PersistentArrayMap).
+;;     Lookup is a linear scan specialized on the probe key's kind; assoc and
+;;     dissoc copy the vector. That is the whole structure: a 3-entry map is a
+;;     record and a 6-slot vector, where a trie-backed small map was a record,
+;;     a node, a leaf pair per entry and an order list on top.
+;;   HASH mode — root is an hnode, the bitmap HAMT above (PersistentHashMap).
+;;
+;; The mode is observable only through iteration order and (class m): equality
+;; and hashing fold over the entries order-independently. A map moves from
+;; array to hash mode when assoc would grow it past the thresholds below, and
+;; never back (PersistentHashMap.without does not demote).
+;;
+;; The pmap record (root cnt hasheq meta, chez-pmap-v6) is defined in values.ss
+;; with the other collection layouts; make-pmap fills the hasheq and meta
+;; defaults.
+(define (make-pmap root cnt) (%mk-pmap root cnt 0 jolt-nil))
+(define (pmap-array? m) (not (hnode? (pmap-root m))))
+(define amap-no-slots (vector))
+(define empty-pmap (make-pmap amap-no-slots 0))            ; {} = the shared empty array map
+(define (fresh-empty-pmap) (make-pmap amap-no-slots 0))   ; an empty result a caller may attach meta to
+(define empty-pmap-hash (make-pmap empty-hnode 0))        ; hash-order backing (sets)
+(define pmap-absent (list 'absent))    ; unique missing-key sentinel
+;; PersistentArrayMap thresholds: assoc of a new key promotes to hash mode once
+;; the map holds 8 entries (HASHTABLE_THRESHOLD = 16 array slots), unless the
+;; ADDED key is a keyword, which rides array mode to 64 entries
+;; (KW_HASHTABLE_THRESHOLD = 128 slots). Only the new key's type is consulted —
+;; PersistentArrayMap.assoc's isKW check — so a keyword assoc'd onto an 8-entry
+;; string-keyed array map keeps it in array mode.
+(define array-map-limit 8)
+(define array-map-limit-kw 64)
+(define (pmap-array-keep? cnt k)
+  (or (fx<? cnt array-map-limit)
+      (and (keyword-t? k) (fx<? cnt array-map-limit-kw))))
+
+;; --- the slot vector ----------------------------------------------------------
+;; Slot index of k among the first n slots of arr, or -1. The compare is chosen
+;; ONCE from the probe key's kind (Util.equivPred), not per slot: a keyword is
+;; interned, so identity is its equality and no other kind of key equals one;
+;; a fixnum only equals a fixnum (5 and 5.0 differ, a bignum never normalizes
+;; into fixnum range); a string only a string; a symbol only a symbol with the
+;; same name and namespace (the name first — it discriminates). Everything
+;; else takes jolt=2. n is passed rather than read so a transient's buffer,
+;; which carries spare capacity, scans only its used slots.
+;;
+;; The loops are unchecked (sa-u*): n <= the vector's length is the caller's
+;; invariant — a map passes the length itself, a transient its used count,
+;; which never exceeds the buffer — and i steps from 0 by 2, so every
+;; vector-ref is in range and every fixnum op stays fixnum. Checked, the same
+;; scan of a 64-keyword map costs 3x (92 -> 33ns at the last slot).
+(define (amap-index arr n k)
+  (cond
+    ((keyword-t? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((eq? (sa-uvector-ref arr i) k) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((fixnum? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (fixnum? x) (sa-ufx=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((string? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (string? x) (string=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ;; A char key fell to the generic jolt=2 arm, which is what a SCANNER keyed on
+    ;; a set of characters does per input position — #{\space \tab \newline} and
+    ;; friends are how Clojure spells a character class. A char is an immediate, so
+    ;; char=? is a single comparison, and the arm measured ~2.4x off the generic
+    ;; one for a six-element set.
+    ((char? k)
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((let ((x (sa-uvector-ref arr i))) (and (char? x) (char=? x k))) i)
+             (else (lp (sa-ufx+ i 2))))))
+    ((symbol-t? k)
+     (let* ((kn (symbol-t-name k)) (kl (string-length kn)) (kns (symbol-t-ns k)))
+       (let lp ((i 0))
+         (cond ((sa-ufx>=? i n) -1)
+               ((let ((x (sa-uvector-ref arr i)))
+                  (and (symbol-t? x)
+                       (let ((xn (symbol-t-name x)))
+                         (or (eq? xn kn)
+                             (and (fx=? (string-length xn) kl) (string=? xn kn))))
+                       (let ((xns (symbol-t-ns x)))
+                         (or (eq? xns kns)
+                             (and (string? xns) (string? kns) (string=? xns kns))))))
+                i)
+               (else (lp (sa-ufx+ i 2)))))))
+    (else
+     (let lp ((i 0))
+       (cond ((sa-ufx>=? i n) -1)
+             ((jolt=2 (sa-uvector-ref arr i) k) i)
+             (else (lp (sa-ufx+ i 2))))))))
+(define (amap-get arr k d)
+  (let ((i (amap-index arr (vector-length arr) k)))
+    (if (fx<? i 0) d (vector-ref arr (fx+ i 1)))))
+;; Slots from a k v k v ... list of n pairs. A repeated key keeps its first
+;; position and takes the LAST value (createAsIfByAssoc), so the result can be
+;; shorter than 2n.
+(define (amap-from-kvs kvs n)
+  (let ((arr (make-vector (fx* 2 n))))
+    (let loop ((kvs kvs) (used 0))
+      (if (null? kvs)
+          (if (fx=? used (vector-length arr)) arr (vec-copy-range arr 0 used))
+          ;; used < 2n while pairs remain (at most one slot pair per list pair)
+          (let* ((k (car kvs)) (v (cadr kvs)) (i (amap-index arr used k)))
+            (if (fx>=? i 0)
+                (begin (sa-uvector-set! arr (sa-ufx+ i 1) v) (loop (cddr kvs) used))
+                (begin (sa-uvector-set! arr used k) (sa-uvector-set! arr (sa-ufx+ used 1) v)
+                       (loop (cddr kvs) (sa-ufx+ used 2)))))))))
+(define (amap-slots->pmap arr) (make-pmap arr (fxsra (vector-length arr) 1)))
+;; array -> hash: the slots become a trie. Keys are distinct by construction.
+(define (amap->hnode arr)
+  (let ((n (vector-length arr)) (added (box #f)))
+    (let loop ((i 0) (root empty-hnode))
+      (if (fx>=? i n) root
+          (let ((k (vector-ref arr i)))
+            (loop (fx+ i 2) (node-assoc root 0 (key-hash k) k (vector-ref arr (fx+ i 1)) added)))))))
+
+;; --- assoc / dissoc -----------------------------------------------------------
+;; growth rule (PersistentArrayMap.assoc): a new key appends to the slots while
+;; the map may stay in array mode; otherwise the slots become a trie first and
+;; the key goes in there. Replacing a key keeps its position. Assoc of the value
+;; already held is the map itself, in both modes.
+(define (pmap-hash-assoc m root k v)
+  (let* ((added (box #f)) (r (node-assoc root 0 (key-hash k) k v added)))
+    (cond ((unbox added) (make-pmap r (fx+ (pmap-cnt m) 1)))
+          ((eq? r root) m)
+          (else (make-pmap r (pmap-cnt m))))))
+(define (pmap-assoc m k v)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (pmap-hash-assoc m root k v)
+        (let ((i (amap-index root (vector-length root) k)))
+          (cond ((fx>=? i 0)
+                 (if (eq? (vector-ref root (fx+ i 1)) v)
+                     m
+                     (make-pmap (vec-set root (fx+ i 1) v) (pmap-cnt m))))
+                ((pmap-array-keep? (pmap-cnt m) k)
+                 (make-pmap (vec-append2 root k v) (fx+ (pmap-cnt m) 1)))
+                (else (pmap-hash-assoc m (amap->hnode root) k v)))))))
+;; force-hash insert for rebuilding a map whose final mode is already decided
+;; (hash-map ctor, a set's backing map).
+(define (pmap-put-hash m k v)
+  (let* ((added (box #f)) (r (node-assoc (pmap-root m) 0 (key-hash k) k v added)))
+    (make-pmap r (if (unbox added) (fx+ (pmap-cnt m) 1) (pmap-cnt m)))))
+(define (pmap-dissoc m k)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (let* ((removed (box #f)) (r (node-dissoc root 0 (key-hash k) k removed)))
+          (if (unbox removed) (make-pmap r (fx- (pmap-cnt m) 1)) m))
+        (let ((i (amap-index root (vector-length root) k)))
+          (cond ((fx<? i 0) m)
+                ;; the reference answers empty() — a fresh empty, since the caller
+                ;; may carry the source's metadata onto it (never onto the shared {})
+                ((fx=? (vector-length root) 2) (fresh-empty-pmap))
+                (else (make-pmap (vec-remove2 root i) (fx- (pmap-cnt m) 1))))))))
+
+;; --- lookup -------------------------------------------------------------------
+(define (pmap-get m k default)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-get root 0 (key-hash k) k default)
+        (amap-get root k default))))
+;; The lookup the emitter and jolt-get route through. Array mode scans its
+;; slots — the keyword scan is inline here, being the shape (:k m) lowers to.
+;; Hash mode is flattened for the key types that dominate real lookups
+;; (keyword, fixnum, string, symbol): the layered path costs ~40ns/call —
+;; case-lambda -> dispatch -> pmap? -> pmap-get -> key-hash -> jolt-hasheq cond
+;; -> node-get -> bitpos/chunk/arr-index/popcount -> VARIADIC jolt= (a rest-list
+;; alloc) -> jolt=2 type walk. Everything here is one procedure so cp0 inlines
+;; the local helpers (bitpos/arr-index/popcount) and the record preds/accessors;
+;; the key compare is specialized (keyword eq? / fixnum = / string string=?)
+;; instead of the generic jolt= walk. Anything else (bignum-keyed, symbolic,
+;; heterogeneous hashes) falls to pmap-get. Semantics identical to node-get.
+(define (pmap-fast-get m k d)
+  (let ((root (pmap-root m)))
+    (cond
+      ((not (hnode? root))
+       (if (keyword-t? k)
+           ;; unchecked like amap-index: n is the vector's own length, i steps
+           ;; from 0 by 2, and slot i+1 exists whenever slot i holds a key
+           (let ((n (vector-length root)))
+             (let lp ((i 0))
+               (cond ((sa-ufx>=? i n) d)
+                     ((eq? (sa-uvector-ref root i) k) (sa-uvector-ref root (sa-ufx+ i 1)))
+                     (else (lp (sa-ufx+ i 2))))))
+           (amap-get root k d)))
+      (else
+       (let ((h (cond ((keyword-t? k) (keyword-t-khash k))
+                      ((fixnum? k) (murmur3-hash-long-flat k))
+                      ((string? k) (string-hasheq k))
+                      ;; A SYMBOL key belongs on this path too. The reference
+                      ;; implementation makes no distinction — Util.equiv/hasheq treat a
+                      ;; Symbol key exactly like a Keyword one, and Symbol caches its
+                      ;; hasheq in a field the way Keyword does — but here a symbol fell
+                      ;; off the fast path entirely and took the generic pmap-get, whose
+                      ;; descent is not type-specialized. symbol-hasheq is already
+                      ;; memoized (on the symbol, and on its name cell), so this is the
+                      ;; same one-field read the keyword arm above is.
+                      ;;
+                      ;; It is a real shape, not a curiosity: code that looks a keyword's
+                      ;; SYMBOL form up in a map does it per lookup. honeysql's clause
+                      ;; walk asks (get m (kw->sym k)) for all 92 clauses on every format.
+                      ((symbol-t? k) (symbol-hasheq k))
+                      (else #f))))
+         (if (and h (fixnum? h))
+             (let ((h (hamt-and h hmask)))
+               (let lp ((node root) (shift 0))
+                 (let* ((bit (hamt-sll 1 (hamt-and (hamt-sra h shift) 31)))
+                        (bm (hnode-bm node)))
+                   (if (hamt=? 0 (hamt-and bm bit)) d
+                       (let ((child (vector-ref (hnode-arr node)
+                                                (hamt-popcount (hamt-and bm (hamt-sub bit 1))))))
+                         (cond ((hnode? child) (lp child (fx+ shift 5)))
+                               ((hcoll? child)
+                                (let ((p (assoc-jolt k (hcoll-alist child)))) (if p (cdr p) d)))
+                               ((let ((ck (car child)))
+                                  (cond ((keyword-t? ck) (and (keyword-t? k) (eq? ck k)))
+                                        ((fixnum? ck) (and (fixnum? k) (fx=? ck k)))
+                                        ((string? ck) (and (string? k) (string=? ck k)))
+                                        (else (jolt=2 ck k))))
+                                (cdr child))
+                               (else d)))))))
+             (node-get root 0 (key-hash k) k d)))))))
+;; the stored (key . value) pair, or #f — `find` builds its entry from this so the
+;; entry's key is the map's own key object, not the equal one probed with.
+(define (pmap-entry-at m k)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-entry root 0 (key-hash k) k)
+        (let ((i (amap-index root (vector-length root) k)))
+          (and (fx>=? i 0) (cons (vector-ref root i) (vector-ref root (fx+ i 1))))))))
+;; pmap-fast-get's descent (flattened, key compare specialized), which no value
+;; can answer with pmap-absent
+(define (pmap-contains? m k)
+  (not (eq? pmap-absent (pmap-fast-get m k pmap-absent))))
+
+;; --- folds --------------------------------------------------------------------
+;; The universal fold idiom across the runtime is `(pmap-fold m (lambda (k v a)
+;; (cons ... a)) '())`, which accumulates in REVERSE visitation order. So that this
+;; reconstructs the map's INSERTION order, pmap-fold visits an array-mode map's
+;; slots from the last pair to the first; a hash-mode map visits HAMT order (its
+;; iteration order is unspecified, so reverse-of-HAMT is equivalent and matches
+;; prior behaviour). Use pmap-fold-fwd when building a value directly in
+;; iteration order.
+(define (pmap-fold m proc acc)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-fold root proc acc)
+        (let loop ((i (fx- (vector-length root) 2)) (acc acc))
+          (if (fx<? i 0) acc
+              (loop (fx- i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc)))))))
+;; visit entries in iteration (insertion) order — for code that builds a new map /
+;; ordered value directly rather than via cons-accumulation.
+(define (pmap-fold-fwd m proc acc)
+  (let ((root (pmap-root m)))
+    (if (hnode? root)
+        (node-fold-fwd root proc acc)
+        (let ((n (vector-length root)))
+          (let loop ((i 0) (acc acc))
+            (if (sa-ufx>=? i n) acc
+                (loop (sa-ufx+ i 2) (proc (sa-uvector-ref root i) (sa-uvector-ref root (sa-ufx+ i 1)) acc))))))))
+
+;; --- constructors -------------------------------------------------------------
+;; map LITERAL ctor ({...}): RT.map/canBePAM — array map up to 8 entries, up to
+;; 64 when every entry PAST the eighth is keyword-keyed (the first 8 slots may
+;; hold any key type). Decided on the entries as written, the way the reference
+;; reads init.length before building: a literal whose computed keys collapse
+;; onto each other still lands in the mode its shape chose. Repeated keys keep
+;; the first position and the last value (the reader has already refused a
+;; literal that repeats a key).
+(define (pam-literal-kvs? kvs n)       ; n = pair count
+  (or (fx<=? n array-map-limit)
+      (and (fx<=? n array-map-limit-kw)
+           (let loop ((kvs (list-tail kvs (fx* 2 array-map-limit))))
+             (or (null? kvs) (and (keyword-t? (car kvs)) (loop (cddr kvs))))))))
+(define (hash-from-kvs kvs)
+  (let loop ((m empty-pmap-hash) (kvs kvs))
+    (if (null? kvs) m (loop (pmap-put-hash m (car kvs) (cadr kvs)) (cddr kvs)))))
+(define (odd-kvs-error who)
+  (throw-jvm (quote IllegalArgumentException) (string-append "odd number of " who)))
+;; The one- and two-entry shapes are fixed arities so a dynamic literal of that
+;; size ({:a x :b y}, the commonest) builds without a rest list.
+(define jolt-hash-map
+  (case-lambda
+    (() empty-pmap)
+    ((k v) (make-pmap (vector k v) 1))
+    ((k1 v1 k2 v2)
+     (if (jolt=2 k1 k2) (make-pmap (vector k1 v2) 1) (make-pmap (vector k1 v1 k2 v2) 2)))
+    (kvs
+     (let ((n2 (length kvs)))
+       (when (fxodd? n2) (odd-kvs-error "map literal entries"))
+       (let ((n (fxsra n2 1)))
+         (if (pam-literal-kvs? kvs n)
+             (amap-slots->pmap (amap-from-kvs kvs n))
+             (hash-from-kvs kvs)))))))
+;; array-map ctor: insertion-ordered (PersistentArrayMap, createAsIfByAssoc).
+;; Never promotes — an explicit array-map stays an array map at any size.
+(define (jolt-array-map-build kvs)
+  (let ((n2 (length kvs)))
+    (when (fxodd? n2) (odd-kvs-error "map entries"))
+    (if (fx=? n2 0) empty-pmap (amap-slots->pmap (amap-from-kvs kvs (fxsra n2 1))))))
+;; hash-map-build: CL function hash-map — always hash-ordered (JVM PersistentHashMap).
+(define (jolt-hash-map-build kvs)
+  (when (fxodd? (length kvs)) (odd-kvs-error "map entries"))
+  ;; (hash-map) with no entries is {} on the JVM, an array map
+  (if (null? kvs) empty-pmap (hash-from-kvs kvs)))
+
+;; The pset record (m hasheq meta, chez-pset-v3) is defined in values.ss with
+;; the other collection layouts; make-pset fills the hasheq and meta defaults.
+(define (make-pset m) (%mk-pset m 0 jolt-nil))
+;; sets are ALWAYS hash-ordered (JVM PersistentHashSet), backed by pmap in hash mode.
+(define empty-pset (make-pset empty-pmap-hash))   ; sets are ALWAYS hash-ordered (JVM PersistentHashSet)
+(define (pset-conj s e) (if (pmap-contains? (pset-m s) e) s (make-pset (pmap-assoc (pset-m s) e e))))
+;; a miss answers s itself, as PersistentHashSet.disjoin does (and pset-conj on a
+;; hit): no allocation, and (identical? s (disj s x)) is how a caller sees the miss
+(define (pset-disj s e)
+  (let* ((m (pset-m s)) (m2 (pmap-dissoc m e))) (if (eq? m2 m) s (make-pset m2))))
+(define (pset-contains? s e) (pmap-contains? (pset-m s) e))
+;; A lookup answers with the element the set HOLDS, not with the equal probe key
+;; it was handed — only the stored one carries the element's metadata, and callers
+;; read it (farolero's return-from derefs (:on-stack? (meta block))). pset-conj
+;; stores each element as both key and value, so the backing map's value IS that
+;; element.
+(define (pset-get s e default) (pmap-get (pset-m s) e default))
+(define (pset-count s) (pmap-cnt (pset-m s)))
+(define (pset-fold s proc acc) (pmap-fold (pset-m s) (lambda (k v a) (proc k a)) acc))
+;; Fold over the stored (element . lookup-value) PAIRS. The two are normally the
+;; same element, but a transient conj! of an element equal to one already in keeps
+;; the old key and stores the new value (JVM ATransientSet.conj = impl.assoc(v,v)),
+;; and persistent! carries that split through — so (seq s) yields the first and
+;; (get s k) the second. Anything that REBUILDS a set element-by-element loses the
+;; split and silently collapses get onto seq's element; the image walker rebuilds,
+;; hence these two.
+(define (pset-fold-pairs s proc acc) (pmap-fold (pset-m s) proc acc))
+(define (pset-from-pairs pairs)   ; pairs: list of (key . lookup-value)
+  (make-pset (fold-left (lambda (m p) (pmap-put-hash m (car p) (cdr p))) empty-pmap-hash pairs)))
+(define (jolt-hash-set . xs) (let loop ((s empty-pset) (xs xs)) (if (null? xs) s (loop (pset-conj s (car xs)) (cdr xs)))))
+
+;; A literal whose keys or elements are not all distinct constants is built
+;; through these: the JVM builds it with createWithCheck, so keys that turn out
+;; equal at run time throw IllegalArgumentException naming the first of them.
+;; ((let [x 1 y 1] #{x y}) is "Duplicate key: 1".) The check is a count compare;
+;; only a literal that did collapse pays for finding the key.
+(define (literal-duplicate-key xs stride)
+  (let loop ((xs xs))
+    (let ((k (car xs)))
+      (if (let scan ((ys (list-tail xs stride)))
+            (and (pair? ys) (or (jolt=2 k (car ys)) (scan (list-tail ys stride)))))
+          (throw-jvm (quote IllegalArgumentException)
+                     (string-append "Duplicate key: " (jolt-str-render-one k)))
+          (loop (list-tail xs stride))))))
+(define jolt-hash-map-checked
+  (case-lambda
+    ((k1 v1 k2 v2)
+     (if (jolt=2 k1 k2)
+         (literal-duplicate-key (list k1 v1 k2 v2) 2)
+         (make-pmap (vector k1 v1 k2 v2) 2)))
+    (kvs
+     (let ((n2 (length kvs)))
+       (when (fxodd? n2) (odd-kvs-error "map literal entries"))
+       (let* ((n (fxsra n2 1))
+              (m (if (pam-literal-kvs? kvs n)
+                     (amap-slots->pmap (amap-from-kvs kvs n))
+                     (hash-from-kvs kvs))))
+         (if (fx=? (pmap-cnt m) n) m (literal-duplicate-key kvs 2)))))))
+(define (jolt-hash-set-checked . xs)
+  (let loop ((s empty-pset) (ys xs) (n 0))
+    (if (null? ys)
+        (if (fx=? (pset-count s) n) s (literal-duplicate-key xs 1))
+        (loop (pset-conj s (car ys)) (cdr ys) (fx+ n 1)))))
+
+;; ============================================================================
+;; leaf ops the emitter lowers core/clojure fns to (mirrors native-ops)
+;; ============================================================================
+;; ---- conj arms: host types register here instead of set!-wrapping jolt-conj1 ----
+(define jolt-conj1-arms '())
+(define (register-conj-arm! pred handler)
+  (set! jolt-conj1-arms (cons (cons pred handler) jolt-conj1-arms)))
+
+;; Assoc every entry of `x` into map `m`, in x's own seq order. jolt models a map
+;; entry as a 2-element vector, so that is the shape each element must have — the
+;; JVM casts to java.util.Map$Entry here and this reports the same failure.
+;; jolt-seq / seq-first / seq-more live in seq.ss, which rt.ss loads after this
+;; file; forward references resolved at call time (cf. jolt-get-dispatch).
+(define (conj-map-entries m x)
+  (let loop ((s (jolt-seq x)) (acc m))
+    (if (jolt-nil? s)
+        acc
+        (let ((e (seq-first s)))
+          (cond
+            ((and (pvec? e) (fx=? 2 (pvec-count e)))
+             (loop (jolt-seq (seq-more s))
+                   (pmap-assoc acc (pvec-nth-d e 0 jolt-nil) (pvec-nth-d e 1 jolt-nil))))
+            ((jolt-host-entry e)
+             => (lambda (kv) (loop (jolt-seq (seq-more s)) (pmap-assoc acc (car kv) (cdr kv)))))
+            (else
+              (jolt-throw
+               (jolt-host-throwable
+                "java.lang.ClassCastException"
+                (string-append "class " (guard (c (#t "?")) (jolt-class-name e))
+                               " cannot be cast to class java.util.Map$Entry")))))))))
+
+(define (jolt-conj1 coll x)
+  (cond ((pvec? coll) (pvec-conj coll x))   ; nil is a valid vector/set element
+        ((pset? coll) (pset-conj coll x))
+        ;; a list/seq conjs by PREPENDING (seq.ss: cseq / empty-list). conj onto a
+        ;; list stays a list, conj onto a lazy/realized seq yields a seq cell (a
+        ;; Cons) — list?-preserving.
+        ((cseq? coll) (if (cseq-list? coll) (cseq-list x coll) (cseq-realized x coll)))
+        ((empty-list-t? coll) (cseq-list x jolt-nil))
+        ;; conj onto a map takes a map ENTRY, a [k v] pair, or anything that seqs
+        ;; INTO entries — which is what makes a record, a sorted map, another
+        ;; native map and a bare seq of entries all work, since each of those seqs
+        ;; into entries. Same shape as the JVM's APersistentMap.cons: the entry and
+        ;; vector cases, then RT.seq and assoc each entry in turn. Asking "does it
+        ;; seq into entries" rather than "is it one of the map types I know" is
+        ;; what keeps conj from disagreeing with map? about what a map is: a record
+        ;; answers true to map? and used to be rejected here.
+        ((pmap? coll)
+         (cond ((jolt-nil? x) coll)                                   ; (conj m nil) = m
+               ;; onto an empty map the answer IS x, as a map without x's own
+               ;; metadata: (merge nil m) is (conj {} m), once per symbol tools.reader
+               ;; reads. The caller carries coll's metadata (meta-carry-conj).
+               ;; Only where assoc'ing x's entries in turn builds the same kind of
+               ;; map in the same order: both hashed, or both arrays small enough
+               ;; that no assoc promotes (an empty hash map stays hashed, and a big
+               ;; array map promotes on the JVM)
+               ((and (pmap? x) (fx=? 0 (pmap-cnt coll)) (eq? (pmap-meta x) jolt-nil)
+                     (if (pmap-array? coll)
+                         (and (pmap-array? x) (fx<=? (pmap-cnt x) array-map-limit))
+                         (not (pmap-array? x))))
+                x)
+               ((pmap? x) (pmap-fold-fwd x (lambda (k v m) (pmap-assoc m k v)) coll))   ; fast path, same rule
+               ;; a vector on the right is one ENTRY, so it must be a pair — never
+               ;; a sequence of entries. The JVM says so by name.
+               ((pvec? x)
+                (if (fx=? 2 (pvec-count x))
+                    (pmap-assoc coll (pvec-nth-d x 0 jolt-nil) (pvec-nth-d x 1 jolt-nil))
+                    (throw-jvm (quote IllegalArgumentException) "Vector arg to map conj must be a pair")))
+               ((jolt-host-entry x) => (lambda (kv) (pmap-assoc coll (car kv) (cdr kv))))
+               ;; jolt-seq raises the JVM's own "Don't know how to create ISeq
+               ;; from: X" for a value that is not seqable at all.
+               (else (conj-map-entries coll x))))
+        ;; a plain defrecord answers from its slots ahead of the arm walk
+        ;; (records-coll.ss jrec-plain?, loaded later — resolved at call time;
+        ;; jrec? first so nothing reaches it before a record can exist)
+        ((and (jrec? coll) (jrec-plain? coll)) (jrec-plain-conj coll x))
+        (else (let loop ((as jolt-conj1-arms))
+                (cond ((null? as)
+                       (cond ((rec-coll-method coll "cons") => (lambda (m) (jolt-invoke m coll x)))
+                             (else (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                                                (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
+                                                               " cannot be cast to class clojure.lang.IPersistentCollection"))))))
+                      (((caar as) coll) ((cdar as) coll x))
+                      (else (loop (cdr as))))))))
+;; (conj) -> []; (conj nil a b ...) builds a list (conj prepending -> (b a)).
+(define (jolt-conj . args)
+  (if (null? args)
+      (jolt-vector)
+      (let ((coll (car args)) (xs (cdr args)))
+        (cond
+          ;; 1-arity returns the coll untouched — (conj nil) is nil
+          ((null? xs) coll)
+          ((jolt-nil? coll) (fold-left jolt-conj1 jolt-empty-list xs))
+          (else (meta-carry-conj coll (fold-left jolt-conj1 coll xs)))))))
+(define jolt-conj2 (lambda (coll x)
+  (if (jolt-nil? coll)
+      (jolt-conj1 jolt-empty-list x)
+      (meta-carry-conj coll (jolt-conj1 coll x)))))
+
+;; A host shim registers a type's get via register-get-arm! (handler: (coll k d) ->
+;; value) instead of set!-wrapping jolt-get — disjoint coll types, checked before the
+;; base map/set/vec/string cases (cf. register-hash-arm!).
+;; Shared probe values for the collection fast paths. Built on demand, not at
+;; load: jolt-empty-list and list->cseq come from seq.ss and make-jrec from
+;; records.ss, both of which rt.ss loads after this file. Every arm registers
+;; later still. See reject-fast-type-claim! (values.ss) for why each registry
+;; passes its own subset rather than sharing one list — jolt-get answers records
+;; but not strings, count/empty/seq answer strings but not records.
+(define (probe-pvec) (jolt-vector))
+(define (probe-pmap) (jolt-hash-map))
+(define (probe-pset) empty-pset)
+(define (probe-cseq) (list->cseq (list 1)))
+;; Spliced, not listed: records.ss builds jrec-fast-type-probe well after
+;; transients.ss has already registered a get arm, so before that point there is
+;; simply no record to probe against.
+(define (probe-jrecs)
+  (probe-if-available (lambda () jrec-fast-type-probe)))
+
+(define (get-fast-probes)
+  (append (list (probe-pmap) (probe-pvec) (probe-pset) "s" jolt-nil) (probe-jrecs)))
+(define (get-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (get-fast-probes) "the jolt-get fast path"))
+(define jolt-get-arms '())
+(define (register-get-arm! pred handler)
+  (get-arm-reject-fast-type! 'register-get-arm! pred)
+  (set! jolt-get-arms (cons (cons pred handler) jolt-get-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-get-arm-last! pred handler)
+  (get-arm-reject-fast-type! 'register-get-arm-last! pred)
+  (set! jolt-get-arms (append jolt-get-arms (list (cons pred handler)))))
+(define (jolt-get-base coll k d)
+  (cond ((pmap? coll) (pmap-get coll k d))
+        ((pset? coll) (pset-get coll k d))
+        ((pvec? coll) (pvec-get coll k d))
+        ((string? coll) (let ((i (num-key-index k)))
+                          (if (and i (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i) d)))
+        (else d)))
+;; A keyword-invoke SITE's cell: the slot index its key was last found at in
+;; an array-mode map. Every map one literal builds is record-shaped — the same
+;; key sits at the same slot — so the site's next lookup is one eq? and one
+;; vector-ref instead of amap-index's scan (2 ns against 6-11 for ten keys), the
+;; shape of a monomorphic inline cache with the slot standing in for the hidden
+;; class. It only ever shortcuts a HIT: a different map at the site, or the key
+;; at another slot, misses the eq? and takes the scan, which re-primes the cell.
+;; The cell is a fixnum in a one-slot vector, hoisted once per site by the
+;; emitter (backend_scheme.clj, the :keyword ifn kind); a racing write from
+;; another thread is a fixnum either way, so the worst concurrent outcome is a
+;; miss. A hash-mode map, a record, nil and every other receiver keep jolt-get's
+;; path, so what the site answers is exactly what jolt-get answers.
+;; Slot 1 is the record half of the site, Clojure's KeywordLookupSite: the
+;; (descriptor . field-slot) a record receiver last answered k from, so a site
+;; that keeps seeing one record type reads the field with one eq? instead of
+;; jolt-get's type cascade and the field-index hashtable. Held as one pair,
+;; replaced whole, so a racing reader never pairs one type's descriptor with
+;; another's slot. Only a defrecord's slot is cached: a record's field-first
+;; lookup is fixed for the life of its descriptor (a redefinition makes a new
+;; descriptor, which misses), while a bare deftype's fields can be masked later
+;; by a valAt it gains (records.ss jrdesc-mask-fields!).
+(define (jolt-kw-site) (make-vector 2 0))
+(define (jolt-kw-rec-get m k site d)
+  (let ((c (if (fx>? (vector-length site) 1) (vector-ref site 1) 0))
+        (desc (jrec-desc m)))
+    (if (and (pair? c) (eq? (car c) desc))
+        (jrec-field-ref m (cdr c))
+        (let ((i (jrec-get-index m k)))
+          (when (and i (fx>? (vector-length site) 1) (jrec-record? m))
+            (vector-set! site 1 (cons desc i)))
+          (if i (jrec-field-ref m i) (jolt-get-dispatch m k d))))))
+(define (jolt-kw-get-site* m k site d)
+  (if (pmap? m)
+      (let ((root (pmap-root m)))
+        (if (hnode? root)
+            (pmap-fast-get m k d)
+            (let ((i (sa-uvector-ref site 0)) (n (vector-length root)))
+              (if (and (fx<? i n) (eq? (sa-uvector-ref root i) k))
+                  (sa-uvector-ref root (sa-ufx+ i 1))
+                  ;; unchecked like amap-index: i steps by 2 below n, and slot
+                  ;; i+1 exists whenever slot i holds a key
+                  (let lp ((j 0))
+                    (cond ((sa-ufx>=? j n) d)
+                          ((eq? (sa-uvector-ref root j) k)
+                           (sa-uvector-set! site 0 j)
+                           (sa-uvector-ref root (sa-ufx+ j 1)))
+                          (else (lp (sa-ufx+ j 2)))))))))
+      (if (jrec? m) (jolt-kw-rec-get m k site d) (jolt-get-dispatch m k d))))
+(define jolt-kw-get-site
+  (case-lambda
+    ((m k site) (jolt-kw-get-site* m k site jolt-nil))
+    ((m k site d) (jolt-kw-get-site* m k site d))))
+
+;; jrec? / jrec-ref live in records.ss (loaded later); these are forward references
+;; resolved at call time. Check concrete types first, then records, then arms.
+(define (jolt-get-dispatch coll k d)
+  (cond ((pmap? coll) (pmap-fast-get coll k d))
+        ;; (get nil k) is the default, and a keyword or a get on a nil map is
+        ;; common (rewrite-clj's (:delimiter context) on a top-level form's nil
+        ;; context): it walked every registered arm first, 90 ns against the
+        ;; JVM's 6 (#1713). No arm may claim nil (get-fast-probes).
+        ((eq? coll jolt-nil) d)
+        ((pvec? coll) (pvec-get coll k d))
+        ((pset? coll) (pset-get coll k d))
+        ((jrec? coll) (jrec-ref coll k d))
+        ;; a string answers here, not after every registered arm's predicate:
+        ;; no arm may claim one (get-fast-probes), so the order is free
+        ((string? coll) (jolt-get-base coll k d))
+        (else (let loop ((as jolt-get-arms))
+                (cond ((null? as) (jolt-get-base coll k d))
+                      (((caar as) coll) ((cdar as) coll k d))
+                      (else (loop (cdr as))))))))
+(define jolt-get
+  (case-lambda
+    ;; pmap is the dominant receiver: keep its path to one call (the arm holds
+    ;; the pmap? test inline; everything else pays jolt-get-dispatch's walk).
+    ((coll k)
+     (if (pmap? coll) (pmap-fast-get coll k jolt-nil) (jolt-get-dispatch coll k jolt-nil)))
+    ((coll k d)
+     (if (pmap? coll) (pmap-fast-get coll k d) (jolt-get-dispatch coll k d)))))
+
+;; A deftype implementing a clojure.lang collection interface (Indexed/Counted/
+;; Associative/ILookup/ISeq/IPersistentCollection) carries the interface method
+;; as an inline impl; the core collection fns fall back to it. find-method-any-
+;; protocol / jolt-invoke load later — resolved at call time.
+(define (rec-coll-method coll name)
+  (and (jrec? coll) (jrec-method coll name)))
+
+(define (jolt-nth-nil-idx! i)
+  (when (jolt-nil? i)
+    (jolt-throw (jolt-host-throwable "java.lang.NullPointerException" "nth index"))))
+;; RT.nth / RT.count word their refusal off getClass().getSimpleName(), not the
+;; canonical name — "Keyword", not "clojure.lang.Keyword"; "core$inc", not
+;; "clojure.core$inc" (a fn class is top level, so only the package is stripped).
+;; simple-class-name (java/records-interop.ss) is that rule, resolved at call time
+;; the way jolt-class-name below it already is.
+(define (unsupported-on-type who coll)
+  (throw-jvm (quote UnsupportedOperationException)
+             (string-append who " not supported on this type: "
+                            (simple-class-name (jolt-class-name coll)))))
+(define jolt-nth
+  (case-lambda
+     ((coll i0)
+      (jolt-nth-nil-idx! i0)
+      (let ((i (->idx i0)))
+        (cond ((pvec? coll) (pvec-nth! coll i))
+              ;; pvec is the dominant receiver (every vector destructure lowers to nth);
+              ;; keep it first so a destructure pays one call, not the walk below.
+              ;; Every other receiver casts the index first, as RT.intCast does.
+              ((begin (index-int-check! i0) #f) #f)
+              ((jolt-nil? coll) jolt-nil)          ; RT.nth(nil, i) is nil at any index
+              ((string? coll) (if (and (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i)
+                                  (jolt-throw (jolt-host-throwable "java.lang.StringIndexOutOfBoundsException"
+                                                                   (string-append "Index " (number->string i)
+                                                                                  " out of bounds for length "
+                                                                                  (number->string (string-length coll)))))))
+              ((or (cseq? coll) (empty-list-t? coll)) (seq-nth coll i #f jolt-nil))
+              ((rec-coll-method coll "nth") => (lambda (m) (jolt-invoke m coll i)))
+              ;; RT.nth reads a CharSequence by charAt once Indexed has missed —
+              ;; jrec-charseq-method (records.ss) resolves at call time.
+              ((jrec-charseq-method coll "charAt") => (lambda (m) (jolt-invoke m coll i)))
+              ;; RT.nthFrom reads a Map.Entry: 0 is the key, 1 the value
+              ((jolt-host-entry coll)
+               => (lambda (kv) (case i ((0) (car kv)) ((1) (cdr kv))
+                                 (else (throw-jvm 'IndexOutOfBoundsException jolt-nil)))))
+              (else (unsupported-on-type "nth" coll)))))
+    ((coll i0 d)
+     (jolt-nth-nil-idx! i0)
+     (let ((i (->idx i0)))
+       (cond ((pvec? coll) (pvec-nth-cast-d coll i d))
+             ;; notFound answers an out-of-range index, not one RT.intCast refuses
+             ((begin (index-int-check! i0) #f) #f)
+             ((jolt-nil? coll) d)                 ; RT.nth(nil, i, notFound) is notFound
+             ((string? coll) (if (and (fx>=? i 0) (fx<? i (string-length coll))) (string-ref coll i) d))
+             ((or (cseq? coll) (empty-list-t? coll)) (seq-nth coll i #t d))
+             ((rec-coll-method coll "nth") => (lambda (m) (jolt-invoke m coll i d)))
+             ((jrec-charseq-method coll "charAt")
+              => (lambda (m) (let ((n (jolt-count coll)))
+                               (if (and (fx>=? i 0) (fx<? i n)) (jolt-invoke m coll i) d))))
+             ((jolt-host-entry coll)
+              => (lambda (kv) (case i ((0) (car kv)) ((1) (cdr kv)) (else d))))
+             ;; NOT (else d). RT.nth's notFound answers an out-of-range INDEX on a
+             ;; type that HAS nth; a type with no nth raises here exactly as it does
+             ;; in the two-arity above. Returning d instead turned "you cannot index
+             ;; this" into "there is nothing at index 0" — which is how a vector
+             ;; destructure of a set bound nil, and (distinct #{1 2 3}) answered
+             ;; (nil 3 2), silently, instead of raising.
+             (else (unsupported-on-type "nth" coll)))))))
+;; The definition above, before the set! wraps that later files put around
+;; jolt-nth: the outermost wrap (natives-array.ss) sends a string straight here,
+;; since no wrap in between intercepts one.
+(define jolt-nth-base jolt-nth)
+
+;; a count is an exact integer (JVM parity: count returns a long). jolt= is
+;; exactness-aware, so this must be exact to match an exact integer literal:
+;; (= 2 (count m)) -> 2 vs exact 2 -> true.
+;; Arm registry for host-type count extensions (lazyseq, sorted, queue, array, etc.)
+;; A host shim registers its type's count via register-count-arm! instead of
+;; set!-wrapping jolt-count (cf. register-hash-arm!). Arms dispatch newest-
+;; registration-first, matching the precedence the set! chains had. The builtin
+;; types stay inline in jolt-count itself, so the arm walk only runs for
+;; extension types. jolt-seq / jolt-empty? / jolt-conj1 / jolt-nth /
+;; jolt-contains? still use set! chains — migrate them to this registry the
+;; same way when touched (each needs its own bench guard; seq is the hottest).
+(define (count-fast-probes)
+  (list (probe-pvec) (probe-pmap) (probe-pset) "s" jolt-nil jolt-empty-list (probe-cseq)))
+(define (count-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (count-fast-probes) "the jolt-count fast path"))
+(define jolt-count-arms '())
+(define (register-count-arm! pred handler)
+  (count-arm-reject-fast-type! 'register-count-arm! pred)
+  (set! jolt-count-arms (cons (cons pred handler) jolt-count-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-count-arm-last! pred handler)
+  (count-arm-reject-fast-type! 'register-count-arm-last! pred)
+  (set! jolt-count-arms (append jolt-count-arms (list (cons pred handler)))))
+(define (jolt-count-base coll)
+  ;; arms exhausted: a deftype/record counts through its declared method.
+  (cond ((rec-coll-method coll "count") => (lambda (m) (jolt-invoke m coll)))
+        (else (unsupported-on-type "count" coll))))
+(define (jolt-count coll)
+  (cond ((pvec? coll) (pvec-count coll))
+        ((pmap? coll) (pmap-cnt coll))
+        ((pset? coll) (pset-count coll))
+        ((string? coll) (string-length coll))
+        ((or (jolt-nil? coll) (empty-list-t? coll)) 0)
+        ;; A vector-backed cell knows how many elements remain without walking
+        ;; them: its backing vector's count less its own index. The JVM says the
+        ;; same thing by having PersistentVector$ChunkedSeq implement Counted,
+        ;; and RT.countFrom stops the moment it reaches a Counted cell —
+        ;; `if(s instanceof Counted) return i + s.count()` — which is why the
+        ;; walk below mirrors that shape rather than testing only the head: a
+        ;; cons onto a vector seq gives plain cells in front of a countable one,
+        ;; and those few steps should still end in the O(1) answer.
+        ;;
+        ;; Walking instead made (count (seq v)) linear where the reference is
+        ;; constant: 18.8ms against 166ns over a million elements.
+        ;;
+        ;; Only the crest-#f shape answers at once. A ChunkedCons (crest set) is
+        ;; a standalone chunk followed by an arbitrary, possibly lazy rest, so its
+        ;; length is not known without forcing — ChunkedCons is deliberately not
+        ;; Counted on the JVM either.
+        ;;
+        ;; A counted cell (cseqn: a list node, a string/array/reverse-vector seq)
+        ;; answers the same way -- PersistentList._count, StringSeq's and RSeq's
+        ;; index arithmetic. A ChunkedCons is passed a whole chunk at a time, its
+        ;; rest taken as the chunk's crest; for a range's chunk whose rest is not
+        ;; built yet that rest is counted from its bounds (range-rest-count), so
+        ;; (count (range n)) is O(1) as LongRange's is.
+        ((cseq? coll)
+         (let loop ((s coll) (n 0))
+           (cond ((jolt-nil? s) n)
+                 ((cseqn? s) (fx+ n (cseqn-cnt s)))
+                 ((cseqv? s)
+                  (let ((m (fx+ n (fx- (pvec-count (cseqv-cvec s)) (cseqv-ci s))))
+                        (cr (cseqv-crest s)))
+                    (if cr
+                        (let ((k (range-rest-count cr)))
+                          (if k (+ m k) (loop (jolt-seq cr) m)))
+                        m)))
+                 (else (loop (jolt-seq (seq-more s)) (fx+ n 1))))))
+        ;; a plain defrecord answers from its slots ahead of the arm walk
+        ;; (records-coll.ss jrec-plain?, loaded later — resolved at call time;
+        ;; jrec? first so nothing reaches it before a record can exist)
+        ((and (jrec? coll) (jrec-plain? coll)) (jrec-plain-count coll))
+        (else (let loop ((as jolt-count-arms))
+                (cond ((null? as) (jolt-count-base coll))
+                      (((caar as) coll) ((cdar as) coll))
+                      (else (loop (cdr as))))))))
+
+(define (jolt-assoc1 coll k v)
+  (cond ((pmap? coll) (pmap-assoc coll k v))
+        ((pvec? coll) (pvec-assoc coll (pvec-key-index! k) v))
+        ((jolt-nil? coll) (pmap-assoc empty-pmap k v))
+        ((rec-coll-method coll "assoc") => (lambda (m) (jolt-invoke m coll k v)))
+        (else (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                           (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
+                                          " cannot be cast to class clojure.lang.Associative"))))))
+(define (jolt-assoc coll . kvs)
+  (meta-carry coll
+    (let loop ((coll coll) (kvs kvs))
+      (cond ((null? kvs) coll)
+            ((null? (cdr kvs)) (throw-jvm (quote IllegalArgumentException) "assoc expects an even number of key/vals"))
+            (else (loop (jolt-assoc1 coll (car kvs) (cadr kvs)) (cddr kvs)))))))
+(define jolt-assoc3 (lambda (coll k v) (meta-carry coll (jolt-assoc1 coll k v))))
+
+(define (jolt-dissoc coll . ks)
+  (cond ((jolt-nil? coll) jolt-nil)
+        ((pmap? coll) (meta-carry coll (fold-left pmap-dissoc coll ks)))
+        (else (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                           (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
+                                          " cannot be cast to class clojure.lang.IPersistentMap"))))))
+(define jolt-dissoc2 (lambda (coll k)
+  (cond ((jolt-nil? coll) jolt-nil)
+        ((pmap? coll) (meta-carry coll (pmap-dissoc coll k)))
+        (else (jolt-throw (jolt-host-throwable "java.lang.ClassCastException"
+                           (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
+                                          " cannot be cast to class clojure.lang.IPersistentMap")))))))
+
+(define (jolt-contains? coll k)
+  (cond ((pmap? coll) (pmap-contains? coll k))
+        ((pset? coll) (pset-contains? coll k))
+        ((pvec? coll) (let ((j (vec-key-index k))) (and j (fx>=? j 0) (fx<? j (pvec-count coll)))))
+        ((jolt-nil? coll) #f)
+        ;; a plain defrecord answers from its slots ahead of the arm walk
+        ;; (records-coll.ss jrec-plain?, loaded later — resolved at call time;
+        ;; jrec? first so nothing reaches it before a record can exist)
+        ((and (jrec? coll) (jrec-plain? coll)) (jrec-has? coll k))
+        ;; a string supports contains? by INDEX only (RT.contains: CharSequence +
+        ;; Number key); any other key — or any unsupported type — is the JVM's
+        ;; IllegalArgumentException.
+        ((string? coll)
+         (if (number? k)
+             (let ((j (num-key-index k))) (and (fx>=? j 0) (fx<? j (string-length coll))))
+             (jolt-throw (jolt-host-throwable
+                          "java.lang.IllegalArgumentException"
+                          "contains? not supported on type: java.lang.String"))))
+        ((or (cseq? coll) (empty-list-t? coll) (number? coll) (boolean? coll)
+             (keyword? coll) (jolt-symbol? coll) (char? coll))
+         (jolt-throw (jolt-host-throwable
+                      "java.lang.IllegalArgumentException"
+                      (string-append "contains? not supported on type: "
+                                     (guard (e (#t "?")) (jolt-class-name coll))))))
+        ;; any type with no contains arm (lazy seqs, fns, atoms, …) is not
+        ;; associative: throw like the eager-seq branch above, not a silent false.
+        (else (let loop ((as jolt-contains-arms))
+                (cond ((null? as)
+                       (jolt-throw (jolt-host-throwable
+                         "java.lang.IllegalArgumentException"
+                         (string-append "contains? not supported on type: "
+                                        (guard (e (#t "?")) (jolt-class-name coll))))))
+                      (((caar as) coll) ((cdar as) coll k))
+                      (else (loop (cdr as))))))))
+
+;; ---- contains? arms: host types register here instead of set!-wrapping jolt-contains? ---
+;; Widest of the four: contains? not only answers the collection types, it THROWS
+;; for the scalars (a number, boolean, keyword, symbol or char is not
+;; associative) before any arm is consulted. An arm claiming one of those would
+;; never run.
+(define (contains-fast-probes)
+  (append (list (probe-pmap) (probe-pset) (probe-pvec) jolt-nil "s"
+                (probe-cseq) jolt-empty-list 0 #t #f
+                (keyword #f "k") (jolt-symbol #f "s") #\a)
+          (probe-jrecs)))
+(define (contains-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (contains-fast-probes) "the jolt-contains? fast path"))
+(define jolt-contains-arms '())
+(define (register-contains-arm! pred handler)
+  (contains-arm-reject-fast-type! 'register-contains-arm! pred)
+  (set! jolt-contains-arms (cons (cons pred handler) jolt-contains-arms)))
+;; At the END of the walk: for a family of rare values whose arm should not add
+;; its predicate to every common one's lookup (the arms run newest first).
+(define (register-contains-arm-last! pred handler)
+  (contains-arm-reject-fast-type! 'register-contains-arm-last! pred)
+  (set! jolt-contains-arms (append jolt-contains-arms (list (cons pred handler)))))
+
+;; ---- empty? arms: host types register here instead of set!-wrapping jolt-empty? ---
+;; Arms dispatch newest-registration-first, matching the set!-chain precedence.
+;; The built-in types stay inline; arms checked before the seq-based fallback.
+(define (empty-fast-probes)
+  (list jolt-nil (probe-pvec) (probe-pmap) (probe-pset) "s" jolt-empty-list (probe-cseq)))
+(define (empty-arm-reject-fast-type! who pred)
+  (reject-fast-type-claim! who pred (empty-fast-probes) "the jolt-empty? fast path"))
+(define jolt-empty-arms '())
+(define (register-empty-arm! pred handler)
+  (empty-arm-reject-fast-type! 'register-empty-arm! pred)
+  (set! jolt-empty-arms (cons (cons pred handler) jolt-empty-arms)))
+
+(define (jolt-empty? coll)
+  (cond ((jolt-nil? coll) #t)
+        ((pvec? coll) (fx=? 0 (pvec-count coll)))
+        ((pmap? coll) (fx=? 0 (pmap-cnt coll)))
+        ((pset? coll) (fx=? 0 (pset-count coll)))
+        ((string? coll) (fx=? 0 (string-length coll)))
+        ((empty-list-t? coll) #t)
+        ((cseq? coll) #f)                            ; a cseq is non-empty by construction
+        ;; a plain defrecord answers from its slots ahead of the arm walk
+        ;; (records-coll.ss jrec-plain?, loaded later — resolved at call time;
+        ;; jrec? first so nothing reaches it before a record can exist)
+        ((and (jrec? coll) (jrec-plain? coll)) (jrec-plain-empty? coll))
+        ;; arm dispatch before the general seq-based fallback
+        (else (let loop ((as jolt-empty-arms))
+                (cond ((null? as) (jolt-nil? (jolt-seq coll)))
+                      (((caar as) coll) ((cdar as) coll))
+                      (else (loop (cdr as))))))))
+
+(define (jolt-stack-throw coll)
+  (jolt-throw (jolt-host-throwable
+               "java.lang.ClassCastException"
+               (string-append "class " (guard (e (#t "?")) (jolt-class-name coll))
+                              " cannot be cast to class clojure.lang.IPersistentStack"))))
+(define (jolt-peek coll)
+  (cond ((pvec? coll) (pvec-peek coll))
+        ;; list peek = first; a non-list seq (range, a rest chain) is not an
+        ;; IPersistentStack on the JVM
+        ((and (cseq? coll) (cseq-list? coll)) (jolt-first coll))
+        ((empty-list-t? coll) (jolt-first coll))
+        ((jolt-nil? coll) jolt-nil)
+        (else (jolt-stack-throw coll))))
+(define (jolt-pop coll)
+  (cond ((jolt-nil? coll) jolt-nil)                                 ; RT.pop(nil) is nil
+        ((pvec? coll) (meta-carry coll (pvec-pop coll)))
+        ;; PersistentList.pop answers its rest as it stands: EMPTY.withMeta(meta())
+        ;; when that rest is empty, otherwise the shared tail node with the tail's
+        ;; own meta. Carrying onto the shared tail would change (rest l) too.
+        ((and (cseq? coll) (cseq-list? coll))
+         (let ((r (jolt-rest coll))) (if (empty-list-t? r) (meta-carry coll r) r)))
+        ((empty-list-t? coll) (jolt-throw (jolt-host-throwable "java.lang.IllegalStateException" "Can't pop empty list")))
+        (else (jolt-stack-throw coll))))
+
+;; ============================================================================
+;; equality / hash hooks called from values.ss (jolt=2 / jolt-hash)
+;; ============================================================================
+(define (jolt-coll? x) (or (pvec? x) (pmap? x) (pset? x)))
+;; SPIKE: hash fast-REJECT. Two colls whose CACHED hasheqs differ cannot be =
+;; (hasheq is =-consistent, pinned by the hasheq gate), so answer #f without
+;; walking. Only ever consults hashes both sides already paid for — an unset
+;; side (0) skips straight to the structural walk, so nothing ever computes a
+;; hash just to compare. Equal hashes prove nothing and fall through.
+(define (hasheq-rejects? ha hb)
+  (and (fixnum? ha) (fixnum? hb)
+       (not (fx=? ha 0)) (not (fx=? hb 0))
+       (not (fx=? ha hb))))
+
+(define (jolt-coll=? a b)
+  (cond
+    ((and (pvec? a) (pvec? b))
+     ;; leaf-run lockstep: a's and b's leaves needn't align (RRB tries have
+     ;; partial leaves), so each stride is the min of both remaining runs.
+     ;; Classic vectors take full-32 strides exactly as before.
+     (if (hasheq-rejects? (pvec-hasheq a) (pvec-hasheq b))
+         #f
+     (let ((na (pvec-count a)))
+       (and (fx=? na (pvec-count b))
+            (let loop ((i 0))
+              (if (fx=? i na) #t
+                  (let*-values (((ca oa) (pv-leaf-for a i))
+                                ((cb ob) (pv-leaf-for b i)))
+                    (let ((run (fxmin (fx- (vector-length ca) oa)
+                                      (fx- (vector-length cb) ob)
+                                      (fx- na i))))
+                      (let cloop ((j 0))
+                        (if (fx>=? j run) (loop (fx+ i run))
+                            ;; jolt=2, not the variadic jolt=: the latter conses a
+                            ;; rest list on EVERY element compare.
+                            (and (jolt=2 (vector-ref ca (fx+ oa j)) (vector-ref cb (fx+ ob j)))
+                                 (cloop (fx+ j 1)))))))))))))
+    ((and (pmap? a) (pmap? b))
+     (if (hasheq-rejects? (pmap-hasheq a) (pmap-hasheq b))
+         #f
+         (and (fx=? (pmap-cnt a) (pmap-cnt b))
+              (let ((ra (pmap-root a)) (rb (pmap-root b)))
+                (if (not (or (hnode? ra) (hnode? rb)))
+                    ;; two slot vectors: look each of a's keys up in b's slots
+                    ;; directly — no closure per entry, the typed scan for the key
+                    (let ((n (vector-length ra)) (nb (vector-length rb)))
+                      (let loop ((i 0))
+                        (or (fx>=? i n)
+                            (let ((j (amap-index rb nb (vector-ref ra i))))
+                              (and (fx>=? j 0)
+                                   (jolt=2 (vector-ref ra (fx+ i 1)) (vector-ref rb (fx+ j 1)))
+                                   (loop (fx+ i 2)))))))
+                    (pmap-fold a (lambda (k v ok) (and ok (jolt=2 (pmap-fast-get b k pmap-absent) v))) #t))))))
+    ((and (pset? a) (pset? b))
+     (if (hasheq-rejects? (pset-hasheq a) (pset-hasheq b))
+         #f
+         (and (fx=? (pset-count a) (pset-count b))
+              (pset-fold a (lambda (e ok) (and ok (pset-contains? b e))) #t))))
+    (else #f)))
+(define (jolt-coll-hash x)
+  (cond
+    ;; cached + leaf-run (hasheq.ss, runtime forward ref like hash-ordered)
+    ((pvec? x) (pvec-hasheq-cached x))
+    ;; maps hash as hashUnordered of entries; each entry contributes hash-ordered of [k v]
+    ;; (APersistentMap.mapHasheq = Murmur3.hashUnordered, MapEntry.hasheq = ordered [k v])
+    ((pmap? x)
+     (or (and (not (= 0 (pmap-hasheq x))) (pmap-hasheq x))
+         (let* ((result (pmap-fold x
+                        (lambda (k v acc)
+                          (cons (add32 (car acc) (entry-hasheq k v))
+                                (fx+ (cdr acc) 1)))
+                        (cons 0 0)))
+                (h (mix-coll-hash (car result) (cdr result))))
+           (pmap-hasheq-set! x h)
+           h)))
+    ;; sets hash as hashUnordered of elements
+    ((pset? x)
+     (or (and (not (= 0 (pset-hasheq x))) (pset-hasheq x))
+         (let* ((result (pset-fold x
+                        (lambda (e acc) (cons (+ (car acc) (jolt-hasheq e)) (fx+ (cdr acc) 1)))
+                        (cons 0 0)))
+                (h (mix-coll-hash (car result) (cdr result))))
+           (pset-hasheq-set! x h)
+           h)))
+    (else (equal-hash x))))

@@ -11,8 +11,9 @@
 #   probe  (default) — a 2-line Scheme program (kernel-probe.scm), the minimal
 #                       BOOT-OK green light.
 #   serve            — the jolt nREPL unikernel: the jolt kernel boot with a
-#                       live compiler (boot-probe.scm from a jolt-lang checkout,
-#                       full profile) + serve.scm (COM1 bencode nREPL endpoint).
+#                       live compiler (boot-probe.scm from the vendored
+#                       jolt-lang/ tree, full profile) + serve.scm (COM1 bencode
+#                       nREPL endpoint).
 #                       Preamble SERVE/READY lines, then pure bencode; drive it
 #                       with ./nrepl-test.py.
 #
@@ -34,7 +35,6 @@
 #   GSC       path to gsc          (default ~/.local/bin/gsc)
 #   LIBKRUN   libkrun prefix       (default /tmp/libkrun)
 #   JOBS      make parallelism     (default 18)
-#   JOLT_LANG jolt-lang repo       (default ../../../../jolt-lang)
 #   JOLT_CC    C compiler override  (default clang; forced below because the
 #              ~100MB boot.c needs clang and the shell often exports CC=gcc)
 set -eu
@@ -44,8 +44,8 @@ GSC="${GSC:-$HOME/.local/bin/gsc}"
 LIBKRUN="${LIBKRUN:-/tmp/libkrun}"
 JOBS="${JOBS:-18}"
 GAMBIT_FULL="/tmp/gambit-full"
-JOLT_LANG="${JOLT_LANG:-$(cd ../../../../jolt-lang && pwd)}"
 HERE="$(pwd)"
+JOLT_BOOT="$HERE/jolt-lang"
 DO_BOOT=
 MODE=probe
 for a in "$@"; do
@@ -61,34 +61,35 @@ mkdir -p src
 case "$MODE" in
   serve)
     # Kernel boot base: cached in src/boot.c. Its ##include "boot-full.ss"
-    # resolves next to boot-probe.scm in jolt-lang, so recompiles happen there.
-    # Recompile only when src/boot.c is missing, REBUILD=1 is set, or the
-    # jolt-lang sources that feed it are newer than the cached boot-probe.c
-    # (e.g. a prelude-shims.ss fix landing after the boot was compiled).
+    # resolves next to boot-probe.scm in the vendored jolt-lang/ tree, so
+    # recompiles happen there. Recompile when src/boot.c or the vendored
+    # boot-probe.c is missing, REBUILD=1 is set, or a vendored boot source is
+    # newer than boot-probe.c (e.g. a prelude-shims.ss fix landing later).
     NEED_BOOT=
     [ -f "$HERE/src/boot.c" ] || NEED_BOOT=1
+    [ -f "$JOLT_BOOT/host/gambit/boot-probe.c" ] || NEED_BOOT=1
     [ -z "${REBUILD:-}" ] || NEED_BOOT=1
-    if [ -z "$NEED_BOOT" ] && [ -f "$JOLT_LANG/host/gambit/boot-probe.c" ]; then
+    if [ -z "$NEED_BOOT" ]; then
       for src in boot-probe.scm boot-full.ss prelude-shims.ss; do
-        if [ "$JOLT_LANG/host/gambit/$src" -nt "$JOLT_LANG/host/gambit/boot-probe.c" ]; then
+        if [ "$JOLT_BOOT/host/gambit/$src" -nt "$JOLT_BOOT/host/gambit/boot-probe.c" ]; then
           NEED_BOOT=1
         fi
       done
     fi
     if [ -n "$NEED_BOOT" ]; then
       echo "[stage] compiling kernel boot (boot-probe.scm -> ~111MB C)..."
-      ( cd "$JOLT_LANG/host/gambit" && "$GSC" -target C -c boot-probe.scm )
-      cp "$JOLT_LANG/host/gambit/boot-probe.c" "$HERE/src/boot.c"
+      ( cd "$JOLT_BOOT/host/gambit" && "$GSC" -target C -c boot-probe.scm )
+      cp "$JOLT_BOOT/host/gambit/boot-probe.c" "$HERE/src/boot.c"
     else
       echo "[stage] kernel boot cached (src/boot.c)"
     fi
     # serve.scm (here) is small: always recompile + relink. Linking emits
     # serve_.c (linkfile named after the LAST module) whose ___LNK_serve__ kmain
-    # passes to ___setup. Link against jolt-lang's boot-probe.c so the module
+    # passes to ___setup. Link against the vendored boot-probe.c so the module
     # name stays "boot-probe", not "boot".
     echo "[stage] compiling serve.scm + linkfile..."
     "$GSC" -target C -c serve.scm
-    "$GSC" -link "$JOLT_LANG/host/gambit/boot-probe.c" "$HERE/serve.c"
+    "$GSC" -link "$JOLT_BOOT/host/gambit/boot-probe.c" "$HERE/serve.c"
     cp serve.c  "$HERE/src/serve.c"
     cp serve_.c "$HERE/src/boot_.c"
     BOOT_LINKER=___LNK_serve__

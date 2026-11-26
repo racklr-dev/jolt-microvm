@@ -9,6 +9,7 @@ host over serial (COM1 `0x3F8` ↔ host stdin/stdout).
 | Protocol | Status | Source | Notes |
 |---|---|---|---|
 | Linux-ABI ELF | booting | `linux-abi/`, `rust/` | **MVP.** libkrun loads the ELF, `rsp` → static stack, `call kmain`. |
+| Gambit (freestanding Scheme) | **boots Scheme** | `gambit/` | `gsc -target C` → bare-metal ELF; runs `(display "BOOT-OK")` under libkrun. |
 | Xen PVH | booting | `pvh/` | `.note.Xen` PHYS32_ENTRY + 32-bit entry. Alternative; not needed for MVP. |
 | Unikraft / Solo5 | deferred | n/a | MULTIBOOT; libkrun 2.0 does not support it (would need a shim/loader). |
 
@@ -27,12 +28,16 @@ secondary). Its binaries are self-contained but glibc-linked, so they run
 
 Anything needing libc, the runtime linker, or Linux syscalls cannot boot via
 `boot-external!`. The direction is to compile *jolt itself* freestanding, via
-jolt → Gambit backend → `gsc -target c` → freestanding C. jolt's Gambit boot
+jolt → Gambit backend → `gsc -target C` → freestanding C. jolt's Gambit boot
 already strips runtime `load` and the filesystem (its `js` target has the same
-constraint), so the compiler side is close. The gap is a bare-metal Gambit OS
-port (heap, serial) plus the Gambit 4.9.7 toolchain (`gsc` is not installed on
-this host yet). A hand-written mini-Lisp (`joltlisp.c` in `jolt-unikernel/`) is
-superseded.
+constraint), so the compiler side is close.
+
+The bare-metal Gambit OS port is DONE and proven: see `gambit/` — a 2-line
+Scheme program (`gsc -target C`) linked against the freestanding Gambit runtime
+(bump heap + COM1 serial, no libc) boots under libkrun and prints `BOOT-OK`.
+The full jolt kernel boot (live compiler + nREPL server) is also done there:
+`./stage.sh serve` then `./nrepl-test.py` drives a COM1 bencode nREPL endpoint.
+The hand-written mini-Lisp (`joltlisp.c` in `jolt-unikernel/`) is superseded.
 
 ## Rust kernel (current toolchain)
 

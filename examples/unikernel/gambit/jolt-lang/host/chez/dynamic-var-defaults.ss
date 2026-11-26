@@ -1,0 +1,110 @@
+;; dynamic-var-defaults.ss — default values for the handful of clojure.core dynamic
+;; vars that aren't emitted into the prelude (*clojure-version*, *assert*, …). Plain
+;; constant def-var!s; *ns* (a namespace object) needs a value type with
+;; get-see-through and map?=false and is tracked separately. The binding-stack
+;; machinery (binding / var-set / thread-bound?) lives in dyn-binding.ss. Loaded
+;; from rt.ss after the value model + def-var!.
+
+;; *jolt-version* — the jolt version string (baked release tag in a binary,
+;; `git describe` under bin/jolt, else "dev"). A plain constant var like
+;; *clojure-version*; same value as (System/getProperty "jolt.version") and
+;; jolt.host/jolt-version. Never nil, so it doubles as am-I-on-jolt detection
+;; the way babashka.version does on bb.
+(def-var! "clojure.core" "*jolt-version*" (jolt-version-string))
+
+;; *clojure-version* — a map {:major 1 :minor 12 :incremental 0 :qualifier nil}.
+(def-dynvar! "clojure.core" "*clojure-version*"
+  (jolt-hash-map (keyword #f "major") 1
+                 (keyword #f "minor") 12
+                 (keyword #f "incremental") 0
+                 (keyword #f "qualifier") jolt-nil))
+
+;; *unchecked-math* — when truthy, the analyzer rewrites +/-/*/inc/dec to their
+;; wrapping 64-bit forms (host-contract.ss hc-unchecked-math?). Defaults false;
+;; a file load rebinds it so a top-level (set! *unchecked-math* …) is file-scoped.
+(def-dynvar! "clojure.core" "*unchecked-math*" #f)
+
+;; *warn-on-reflection* — jolt has no reflection, so the var reads false; (set!
+;; *warn-on-reflection* …) resolves and updates it (a no-op effect).
+(def-var-with-meta! "clojure.core" "*warn-on-reflection*" #f
+  (jolt-hash-map (keyword #f "dynamic") #t))
+
+;; *assert* — gates `assert`; settable/bindable (malli.assert toggles it). Default
+;; true, like the JVM.
+(def-var-with-meta! "clojure.core" "*assert*" #t
+  (jolt-hash-map (keyword #f "dynamic") #t))
+
+;; *print-readably* — bound by pr-family / with-out-str-style code; default true.
+(def-dynvar! "clojure.core" "*print-readably*" #t)
+
+;; *print-meta* — when true, pr prints metadata with a ^ prefix; default false.
+(def-dynvar! "clojure.core" "*print-meta*" #f)
+
+;; *print-length* / *print-level* — collection print limits, honored by both
+;; printers (rt.ss jolt-pr-str + printing.ss jolt-pr-readable). nil = unlimited
+;; (the default); a number truncates elements / collapses depth to "#".
+;; *print-length* limits a lazy/infinite seq before realizing it.
+(def-dynvar! "clojure.core" "*print-length*" jolt-nil)
+(def-dynvar! "clojure.core" "*print-level*" jolt-nil)
+;; *default-data-reader-fn* — a (fn [tag value]) the reader consults for an
+;; unregistered #tag before raising; nil = no default handler.
+(def-dynvar! "clojure.core" "*default-data-reader-fn*" jolt-nil)
+
+;; Portable clojure.core dynamic vars whose DEFAULT already matches jolt's
+;; behaviour, so exposing them is sound (resolve/binding work, reads return the
+;; right value) — not a silent divergence.
+;;
+;; *read-eval* — gates the reader's #=() read-eval (reader.ss consults the
+;; current binding per use, so (binding [*read-eval* false] …) refuses it).
+(def-dynvar! "clojure.core" "*read-eval*" #t)
+;; *print-dup* — gates print-dup (a multimethod that exists); default false.
+(def-dynvar! "clojure.core" "*print-dup*" #f)
+;; *print-namespace-maps* — jolt never prints the #:ns{…} map shorthand, so the
+;; var reads true (matches JVM 1.12.5, verified); settable for code that toggles it.
+(def-dynvar! "clojure.core" "*print-namespace-maps*" #t)
+;; *flush-on-newline* — jolt flushes line output; default true.
+(def-dynvar! "clojure.core" "*flush-on-newline*" #t)
+;; *compile-files* — true for the extent of a compile, like the JVM. The loader
+;; reads it: a namespace loaded from source while it is set is also written to
+;; *compile-path*, which is what carries (compile 'lib) through lib's whole load
+;; closure (loader.ss cpath-compiling-dir, RT.load's COMPILE_FILES branch).
+(def-dynvar! "clojure.core" "*compile-files*" #f)
+;; *math-context* — BigDecimal rounding context; nil = unlimited, jolt's default.
+(def-dynvar! "clojure.core" "*math-context*" jolt-nil)
+;; *command-line-args* — the args after the script/-main; nil outside a -m run.
+(def-dynvar! "clojure.core" "*command-line-args*" jolt-nil)
+;; *file* — the source file being loaded; "NO_SOURCE_PATH" when none, like the JVM.
+(def-dynvar! "clojure.core" "*file*" "NO_SOURCE_PATH")
+
+;; REPL result/exception history. Bound by the REPL after each evaluation; nil
+;; outside a REPL, which is what reading them returns here.
+(def-dynvar! "clojure.core" "*1" jolt-nil)
+(def-dynvar! "clojure.core" "*2" jolt-nil)
+(def-dynvar! "clojure.core" "*3" jolt-nil)
+(def-dynvar! "clojure.core" "*e" jolt-nil)
+
+;; *agent* — the agent whose action is currently running; the agent worker
+;; binds it around each action (concurrency.ss), nil elsewhere like the JVM.
+(def-dynvar! "clojure.core" "*agent*" jolt-nil)
+;; *repl* — true inside an interactive session; jolt's repl and the nREPL
+;; eval path bind it. False in a plain run, like clojure.main.
+(def-dynvar! "clojure.core" "*repl*" #f)
+;; *allow-unresolved-vars* — read by the analyzer through jolt.host/allow-
+;; unresolved-vars?, the way Compiler.resolveIn reads RT.ALLOW_UNRESOLVED_VARS.
+;; Default false: an unqualified symbol with no mapping is a compile error
+;; wherever it appears. Bound true, it resolves late instead (nREPL binds it).
+(def-dynvar! "clojure.core" "*allow-unresolved-vars*" #f)
+;; *compile-path* — the directory clojure.core/compile writes a namespace's
+;; compiled artifact to (loader.ss). "classes" like the JVM, where clojure.main
+;; binds it from the clojure.compile.path property; nil raises "*compile-path*
+;; not set" from compile, as it does on the JVM.
+(def-dynvar! "clojure.core" "*compile-path*" "classes")
+;; Compiler/loader flags with no separate machinery here — the defaults match
+;; the JVM so reads and (binding …) behave; setting them has no further effect.
+(def-dynvar! "clojure.core" "*compiler-options*" jolt-nil)
+(def-dynvar! "clojure.core" "*fn-loader*" jolt-nil)
+(def-dynvar! "clojure.core" "*reader-resolver*" jolt-nil)
+(def-dynvar! "clojure.core" "*source-path*" "NO_SOURCE_FILE")
+(def-dynvar! "clojure.core" "*suppress-read*" jolt-nil)
+(def-dynvar! "clojure.core" "*use-context-classloader*" #t)
+(def-dynvar! "clojure.core" "*verbose-defrecords*" #f)

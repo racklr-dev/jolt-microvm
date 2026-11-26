@@ -1,0 +1,105 @@
+;; vars as first-class objects — (var x) / #'x.
+;;
+;; The emitter lowers :the-var to (jolt-var ns name) — the rt.ss var-cell, which
+;; is now also a Clojure VAR value. var? / var-get / deref-of-var / var-as-IFn /
+;; var equality / pr-str(#'ns/name) operate on it. bound? is overridden natively
+;; in post-prelude.ss (the overlay reads (get v :root), nil on a record).
+;;
+;; Dynamic binding (binding / with-bindings* / var-set / thread-bound? /
+;; with-redefs) lives in dyn-binding.ss, which chains the var-read paths set up
+;; here.
+;;
+;; Loaded LAST (after natives-transduce.ss): chains jolt-deref (atom/volatile arms)
+;; and the printers.
+
+(define (jolt-var-pred? x) (var-cell? x))
+
+;; the var's current root. Lenient on an unbound root: returns the sentinel, so
+;; var-get / @ on an unbound var match a plain read (JVM Var$Unbound parity —
+;; nothing throws).
+(define (jolt-var-get v)
+  (if (var-cell? v)
+      (var-cell-root v)
+      (jolt-cast-throw v "clojure.lang.Var")))
+
+;; deref of a var -> its root.
+(define %v-deref jolt-deref)
+(set! jolt-deref (lambda (x) (if (var-cell? x) (jolt-var-get x) (%v-deref x))))
+
+;; a var is an IFn — invoking it invokes its root value ((var f) args -> (f args)).
+;; Folded into jolt-invoke's prefix arms (seq.ss) instead of set!-wrapping it, so a
+;; dynamic call pays one lambda, one rest-list, no re-apply. (jolt-invoke here is
+;; the collapsed seq.ss definition: re-entering it with the root value runs the
+;; raw-procedure fast path.)
+(register-invoke-prefix-arm! var-cell?
+  (lambda (f args) (apply jolt-invoke (var-cell-root f) args)))
+
+;; two var cells are = iff same ns/name (Clojure var identity).
+(register-eq-arm! (lambda (a b) (or (var-cell? a) (var-cell? b)))
+                  (lambda (a b) (and (var-cell? a) (var-cell? b)
+                                     (string=? (var-cell-ns a) (var-cell-ns b))
+                                     (string=? (var-cell-name a) (var-cell-name b)))))
+
+;; pr-str / str of a var -> #'ns/name.
+(define (var->str v) (string-append "#'" (var-cell-ns v) "/" (var-cell-name v)))
+(register-pr-arm! var-cell? var->str)
+(register-str-render! var-cell? var->str)
+
+;; an unbound var's sentinel names its var: str -> "Unbound: #'ns/name",
+;; pr-str -> #object[clojure.lang.Var$Unbound 0 "Unbound: #'ns/name"].
+(define (unbound-marker-str u)
+  (string-append "Unbound: #'" (jolt-var-unbound-ns u) "/" (jolt-var-unbound-name u)))
+(define (unbound-marker-pr u)
+  (string-append "#object[clojure.lang.Var$Unbound 0 \"" (unbound-marker-str u) "\"]"))
+(register-pr-str-arm! jolt-var-unbound? unbound-marker-str)
+(register-str-render! jolt-var-unbound? unbound-marker-str)
+(register-pr-readable-arm! jolt-var-unbound? unbound-marker-pr)
+;; (class an-unbound-var) is clojure.lang.Var$Unbound, like the JVM — without
+;; this arm it fell through to :object, so using a var's value inside its own
+;; definition ((def x (+ x 1)), or a macro's expander referencing the var it
+;; defines) reported "class :object cannot be cast to …" instead of the JVM's
+;; "class clojure.lang.Var$Unbound cannot be cast to …" / "ISeq from Var$Unbound".
+(register-class-arm! jolt-var-unbound? (lambda (u) "clojure.lang.Var$Unbound"))
+
+;; clojure.lang.Var$TBox — the box one thread binding lives in, and the whole of
+;; what (.getThreadBinding v) hands back. Its two JVM fields (thread, val) are
+;; package-private, so NOTHING reads them from Clojure: (.val b) and (.-val b)
+;; both raise "No matching field found" there, exactly as they do here by
+;; falling through to dispatch-miss. That leaves three observables, and this
+;; type carries all three: the box is non-nil iff a binding is in place, its
+;; class is clojure.lang.Var$TBox, and two reads of the SAME binding frame are
+;; identical? while a read from an inner frame is not. The last one is why the
+;; record holds the frame ENTRY rather than a copy of its value — dyn-binding.ss
+;; interns one box per entry, and a box built per call would read back as a
+;; different object, which it is not on the JVM.
+(define-record-type jolt-var-tbox (fields entry) (nongenerative jolt-var-tbox-v1))
+;; The JVM renders a TBox with Object.toString, so the suffix is an identity
+;; hash in hex — per-object and not reproducible across runs there either. The
+;; unbound marker above prints a literal 0 because corpus rows pin its text; a
+;; box's text is pinned by prefix only, so it can carry a real per-object id and
+;; two distinct boxes print differently, as they do on the JVM.
+(define (tbox-hex b) (number->string (jolt-identity-hasheq b) 16))
+(define (tbox-str b) (string-append "clojure.lang.Var$TBox@" (tbox-hex b)))
+(define (tbox-pr b)
+  (let ((h (tbox-hex b)))
+    (string-append "#object[clojure.lang.Var$TBox 0x" h
+                   " \"clojure.lang.Var$TBox@" h "\"]")))
+(register-pr-str-arm! jolt-var-tbox? tbox-str)
+(register-str-render! jolt-var-tbox? tbox-str)
+(register-pr-readable-arm! jolt-var-tbox? tbox-pr)
+(register-class-arm! jolt-var-tbox? (lambda (b) "clojure.lang.Var$TBox"))
+;; (class a-reify) is a generated "ns$reify__N" class on the JVM — an unstable
+;; per-eval name jolt can't reproduce, so (like the fixed AFunction$fn__0 stand-in
+;; for an anonymous fn) it reports a stable reify-shaped placeholder rather than
+;; the :object fallback. The protocols it satisfies drive instance?/satisfies?,
+;; not this name.
+;; answered by jolt-class-name's fast path (host-class.ss class-fast-name), which
+;; is also why no arm may claim a reify now.
+
+;; bound? — native (the overlay's (get v :root) is nil on a var-cell record).
+(define (jolt-var-bound-one? v) (and (var-cell? v) (not (jolt-var-unbound? (var-cell-root v)))))
+(define (jolt-bound? . vars) (if (for-all jolt-var-bound-one? vars) #t #f))
+
+(def-var! "clojure.core" "var?" jolt-var-pred?)
+(def-var! "clojure.core" "var-get" jolt-var-get)
+(def-var! "clojure.core" "deref" jolt-deref)

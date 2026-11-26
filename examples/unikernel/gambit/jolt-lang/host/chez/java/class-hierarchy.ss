@@ -1,0 +1,1851 @@
+;; class-hierarchy.ss — one JVM class/interface graph, the single source of truth
+;; for every "what classes does this satisfy" question. value-host-tags (protocol
+;; dispatch), instance?, isa?/supers/ancestors, and the exception hierarchy all
+;; derive from the ONE table here instead of maintaining parallel hand-kept lists
+;; that drift apart.
+;;
+;; The graph is keyed by canonical (FQN) class name -> its DIRECT super
+;; interfaces/classes (also FQN). Transitivity is computed (jch-closure), so a row
+;; lists only what a class directly extends/implements, matching the JVM source.
+;;
+;; It is OPEN: a library registers a class and its supers with
+;; jolt.host/register-class-supers! (plus a class-arm in host-class.ss to map its
+;; values to that class name), and every derived view picks the class up with no
+;; core change. Loaded before records.ss so value-host-tags can derive from it.
+
+;; canonical-name -> list of direct super canonical-names. Mutable + extensible.
+(define jvm-class-parents (make-hashtable string-hash string=?))
+;; closure cache, invalidated whenever the graph is extended. A Chez hashtable
+;; corrupts under concurrent WRITES (the damage surfaces later inside the
+;; collector, never as an error naming the table), and these two are memo caches on
+;; the protocol-dispatch path, so every thread that dispatches fills them.
+;;
+;; jch-cache-mutex covers every MUTATION of jvm-class-parents, every WHOLE-TABLE
+;; scan of it, both derived caches, and jch-graph-epoch. Single-key reads stay
+;; unlocked, on the split rt.ss spells out for var-table — these are strong
+;; general hashtables, so an unlocked reader walks consistent structure and the
+;; worst it sees is a stale miss. That is not a nicety here: jch-tags is on the
+;; protocol-dispatch path and jch-closure under it, so a mutex on the read would
+;; sit on every protocol call in the program. Steady state is pure reads, so this
+;; costs nothing once warm.
+;;
+;; jch-graph-epoch is the graph's generation, and it does two jobs.
+;;
+;; Invalidation is a hashtable-clear!, and a clear can be undone. jch-closure /
+;; jch-tags compute outside the lock (the walk is not cheap and calls nothing that
+;; needs one), so without a generation a walk that began before a jch-set-supers!
+;; could publish its pre-change answer after the clear, and every later dispatch
+;; would read it. A stale ancestry is a wrong isa? and a wrong protocol method,
+;; and it would never expire. Each publish re-checks the generation it computed
+;; against.
+;;
+;; It is also read by callers that derive a per-type answer from the graph and
+;; want to revalidate with one fixnum compare instead of re-walking (jrdesc-ifc-of,
+;; records.ss) — a deftype gains interfaces after its descriptor exists, and can
+;; gain more later through extend-type. Bumped LAST, after the table is written
+;; and the memo caches are cleared: a concurrent reader that saw the new epoch
+;; first could derive from the old graph and stamp the answer as current, which
+;; revalidation could never catch.
+(define jch-cache-mutex (make-mutex))
+(define jch-graph-epoch 0)
+;; Runs after a class is registered, OUTSIDE jch-cache-mutex, with its name. The
+;; class-token interner (host-static-classes.ss) installs it to drop a token it
+;; interned under the JVM spelling of a deftype before the deftype existed. Outside
+;; the mutex because the interner takes its own lock first and then asks the graph,
+;; and the hook path must not take the two in the other order.
+(define jch-class-registered-hook (lambda (name) (void)))
+(define jch-closure-cache (make-hashtable string-hash string=?))
+(define jch-tags-cache (make-hashtable string-hash string=?))
+;; call with jch-cache-mutex HELD
+(define (jch-invalidate!/locked)
+  (hashtable-clear! jch-closure-cache)
+  (hashtable-clear! jch-tags-cache)
+  (set! jch-graph-epoch (fx+ jch-graph-epoch 1)))
+
+;; Merge direct supers for a class (union with any already registered). Public so
+;; libraries can graft their own classes onto the modeled hierarchy.
+(define (jch-register-supers! name supers)
+  ;; the read-modify-write is ONE step: two threads grafting different supers
+  ;; onto the same class would otherwise each union against the value they read
+  ;; and the second write would drop the first's.
+  (jolt-with-mutex jch-cache-mutex
+    (let ((cur (hashtable-ref jvm-class-parents name '())))
+      (hashtable-set! jvm-class-parents name
+                      (let add ((ss supers) (acc cur))
+                        (cond ((null? ss) acc)
+                              ((member (car ss) acc) (add (cdr ss) acc))
+                              (else (add (cdr ss) (append acc (list (car ss)))))))))
+    ;; the name tables are derived from the rows too (jch-set-supers! resets
+    ;; them the same way); left alone, jch-known? missed a class registered here
+    (set! jch-known-cache #f)
+    (set! jch-simple->fqn-cache #f)
+    (set! jch-jvm-name-cache #f)
+    (jch-invalidate!/locked)))
+
+;; Register a class no other class can name as a super yet — a reify form's or a
+;; proxy's generated class, made the moment it is first asked for. Adding such a
+;; leaf changes no other class's ancestry, so nothing derived from the graph goes
+;; stale: the epoch is not bumped (which would flush every dispatch cache, once
+;; per reify form evaluated), only the new name's own memo entries are dropped,
+;; and the name tables take it in place. A name the graph already has goes the
+;; ordinary way.
+(define (jch-register-leaf! name supers)
+  (let ((new? (jolt-with-mutex jch-cache-mutex
+                (and (not (hashtable-contains? jvm-class-parents name))
+                     (begin
+                       (hashtable-set! jvm-class-parents name supers)
+                       (hashtable-delete! jch-closure-cache name)
+                       (hashtable-delete! jch-tags-cache name)
+                       ;; the known-name table is published whole and read with no
+                       ;; lock: add to a copy and publish that
+                       (let ((k jch-known-cache))
+                         (when k
+                           (let ((c (hashtable-copy k #t)))
+                             (for-each (lambda (n) (hashtable-set! c n #t) (hashtable-set! c (jch-last-segment n) #t))
+                                       (cons name supers))
+                             (set! jch-known-cache c))))
+                       (set! jch-simple->fqn-cache #f)
+                       (set! jch-jvm-name-cache #f)
+                       #t)))))
+    (if new?
+        (jch-class-registered-hook name)
+        (jch-register-supers! name supers))))
+
+;; A munged fn class name "ns$name" (jolt-class for a def'd fn) isn't in the
+;; table; like the JVM (a fn extends clojure.lang.AFunction) its super is
+;; AFunction, whose registered supers give AFn / IFn / Fn / Runnable / Callable
+;; transitively.
+(define (str-has-dollar? s)
+  (let loop ((i 0)) (and (< i (string-length s)) (or (char=? (string-ref s i) #\$) (loop (+ i 1))))))
+
+;; A row registered with NO supers (java.util.Map$Entry, a marker interface) is
+;; still a row: only a name the table has never seen falls to the fn rule. It
+;; used to read an empty row as absent, and a $ in the name then made the
+;; interface a fn — (supers java.util.Map$Entry) answered the AFunction chain.
+(define (jch-direct-supers name)
+  (let ((direct (hashtable-ref jvm-class-parents name #f)))
+    (cond (direct direct)
+          ((str-has-dollar? name) '("clojure.lang.AFunction"))
+          (else '()))))
+
+;; Replace a class's direct supers outright (defrecord re-declares the row its
+;; deftype half registered). Same cache invalidation as a register.
+(define (jch-set-supers! name supers)
+  (jolt-with-mutex jch-cache-mutex
+    (hashtable-set! jvm-class-parents name supers)
+    (set! jch-known-cache #f)
+    (set! jch-simple->fqn-cache #f)
+    (set! jch-jvm-name-cache #f)
+    (jch-invalidate!/locked))
+  (jch-class-registered-hook name))
+
+;; transitive supers of NAME (canonical), excluding NAME and Object; Object is the
+;; universal root supplied by callers. Breadth-first, deduped, stable order.
+(define (jch-closure name)
+  (or (hashtable-ref jch-closure-cache name #f)
+      (let* ((epoch jch-graph-epoch)      ; read BEFORE the walk — see jch-graph-epoch
+             (result
+              (let loop ((pending (jch-direct-supers name)) (seen '()))
+                (cond ((null? pending) (reverse seen))
+                      ((member (car pending) seen) (loop (cdr pending) seen))
+                      (else (loop (append (jch-direct-supers (car pending)) (cdr pending))
+                                  (cons (car pending) seen)))))))
+        (jolt-with-mutex jch-cache-mutex
+          (when (fx= epoch jch-graph-epoch) (hashtable-set! jch-closure-cache name result)))
+        result)))
+
+;; ns segment munging for a JVM-spelled class name: dashes become underscores
+;; (clojure.core-test.x -> clojure.core_test.x).
+(define (jch-munge-segments s)
+  (list->string (map (lambda (c) (if (char=? c #\-) #\_ c)) (string->list s))))
+
+(define (jch-last-segment s)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) s)
+          ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
+          ((char=? (string-ref s i) #\$) (substring s (+ i 1) (string-length s)))
+          (else (loop (- i 1))))))
+
+;; The name a NAMESPACE maps a class under — the part after the last dot, $ and
+;; all: the JVM imports java.util.Map$Entry as Map$Entry, not as Entry. Distinct
+;; from jch-last-segment above, which goes on past the $ because its job is the
+;; alternative SPELLING a protocol extension may use for a tag.
+(define (jch-import-name s)
+  (let loop ((i (- (string-length s) 1)))
+    (cond ((< i 0) s)
+          ((char=? (string-ref s i) #\.) (substring s (+ i 1) (string-length s)))
+          (else (loop (- i 1))))))
+
+;; The protocol-dispatch / instance? tag list for a value of class NAME: the class
+;; and its whole ancestry, each in BOTH canonical and simple spelling (extend-protocol
+;; and instance? accept either "Associative" or "clojure.lang.Associative"), plus
+;; "Object". Memoized — this is on the hot protocol-dispatch path.
+(define (jch-tags name)
+  (or (hashtable-ref jch-tags-cache name #f)
+      (let* ((epoch jch-graph-epoch)      ; read BEFORE the walk — see jch-graph-epoch
+             (chain (cons name (jch-closure name)))
+             (result
+              (let build ((cs chain) (acc '()))
+                (if (null? cs)
+                    (reverse (cons "Object" acc))
+                    (let* ((fqn (car cs))
+                           (simple (jch-last-segment fqn))
+                           (acc1 (if (member fqn acc) acc (cons fqn acc)))
+                           (acc2 (if (or (string=? simple fqn) (member simple acc1))
+                                     acc1 (cons simple acc1))))
+                      (build (cdr cs) acc2))))))
+        (jolt-with-mutex jch-cache-mutex
+          (when (fx= epoch jch-graph-epoch) (hashtable-set! jch-tags-cache name result)))
+        result)))
+
+;; Is WANTED (canonical or simple) the class CHILD (canonical) or one of its
+;; ancestors? Object is every class's root. Matched by full name or last segment so
+;; "IOException" and "java.io.IOException" both hit.
+(define (jch-isa? child wanted)
+  ;; by simple name only when one side is a simple name: two dotted names are
+  ;; two classes unless they are the same name (a.R is not b.R)
+  (let ((wseg (jch-last-segment wanted)) (wdot? (memv #\. (string->list wanted))))
+    (or (string=? wanted "java.lang.Object") (string=? wanted "Object")
+        (let loop ((names (cons child (jch-closure child))))
+          (cond ((null? names) #f)
+                ((or (string=? wanted (car names))
+                     (and (not (and wdot? (memv #\. (string->list (car names)))))
+                          (string=? wseg (jch-last-segment (car names))))) #t)
+                (else (loop (cdr names))))))))
+
+;; Does the graph model WANTED at all (as a class or as any class's ancestor)? Used
+;; by instance? to decide between a definitive #f and 'pass (defer to other arms).
+;; Built lazily, and published only once COMPLETE. It used to (set! … (make-…))
+;; first and fill afterwards, which put an EMPTY table in the global for the
+;; duration of the scan: a second thread calling instance? in that window read it
+;; and got a definitive #f for a class the graph does model. Building into a local
+;; and publishing with one set! makes the window unobservable, and the
+;; double-check under the mutex means two racers agree on one table rather than
+;; each filling their own. The hit path — every instance? after the first — is a
+;; single global read and no lock.
+(define jch-known-cache #f)
+(define (jch-known-table)
+  (or jch-known-cache
+      (jolt-with-mutex jch-cache-mutex
+        (or jch-known-cache
+            (let ((t (make-hashtable string-hash string=?)))
+              (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+                (vector-for-each
+                 (lambda (k supers)
+                   (hashtable-set! t k #t)
+                   (hashtable-set! t (jch-last-segment k) #t)
+                   (for-each (lambda (s)
+                               (hashtable-set! t s #t)
+                               (hashtable-set! t (jch-last-segment s) #t))
+                             supers))
+                 keys vals))
+              (set! jch-known-cache t)
+              t)))))
+(define (jch-known? wanted)
+  ;; bind once: an invalidation between the two probes would otherwise hand the
+  ;; second one #f instead of a table
+  (let ((t (jch-known-table)))
+    (or (hashtable-ref t wanted #f)
+        (hashtable-ref t (jch-last-segment wanted) #f))))
+
+;; Exact membership, no last-segment fallback. The fallback above is there so a
+;; SIMPLE name answers (chez-condition-exc-class hands over "ArityException"),
+;; but it also makes every dotted name whose last segment happens to be modeled —
+;; fake.pkg.String, no.such.Class — read as known. A caller asking "does the host
+;; back THIS class" rather than "have I seen this name" wants this one.
+(define (jch-known-exact? wanted)
+  (and (hashtable-ref (jch-known-table) wanted #f) #t))
+
+;; JVM spelling -> registered name, for every class the graph registers under a
+;; name that is not its JVM spelling. A deftype/defrecord in ns rf.def-two is
+;; registered as rf.def-two.R3 — the namespace as written, which is what its
+;; values report and what ns-qualified lookups key on — and is rf.def_two.R3 on
+;; the JVM, where Compiler.munge turns the dash into an underscore. Host classes
+;; never differ. Same build-into-a-local-then-publish rule as jch-known-table
+;; above, for the same reason, and invalidated at the same sites.
+(define jch-jvm-name-cache #f)
+(define (jch-jvm-name-table)
+  (or jch-jvm-name-cache
+      (jolt-with-mutex jch-cache-mutex
+        (or jch-jvm-name-cache
+            (let ((t (make-hashtable string-hash string=?)))
+              (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+                (vector-for-each
+                 (lambda (k)
+                   (let ((m (jch-munge-segments k)))
+                     (unless (string=? m k) (hashtable-set! t m k))))
+                 keys))
+              (set! jch-jvm-name-cache t)
+              t)))))
+;; The name jolt registers a class under, given any spelling the JVM accepts for
+;; it: the registration itself, else the registered name whose JVM spelling is
+;; NM. #f for a class the graph models under neither. Every seam that takes a
+;; class NAME from source asks this — resolve, a class symbol in code (through
+;; the token interner), :import, Class/forName, the record-literal reader,
+;; extend-protocol — so rf.def_two.R3 and rf.def-two.R3 are one class everywhere.
+(define (jch-registered-name nm)
+  (cond ((hashtable-ref (jch-known-table) nm #f) nm)
+        ((hashtable-ref (jch-jvm-name-table) nm #f))
+        (else #f)))
+
+;; simple last-segment -> canonical FQN for a modeled class (first registered
+;; wins). Lets a simple exception name (from chez-condition-exc-class) resolve to
+;; its graph key so the exception hierarchy answers through the one graph.
+;; Same publish-when-complete rule as jch-known-table above, and for the same
+;; reason: a half-filled table here resolves a simple exception name to itself
+;; instead of its FQN.
+(define jch-simple->fqn-cache #f)
+(define (jch-simple->fqn-table)
+  (or jch-simple->fqn-cache
+      (jolt-with-mutex jch-cache-mutex
+        (or jch-simple->fqn-cache
+            (let ((t (make-hashtable string-hash string=?)))
+              (let-values (((keys vals) (hashtable-entries jvm-class-parents)))
+                (vector-for-each
+                 (lambda (k supers)
+                   (for-each (lambda (n)
+                               (let ((seg (jch-last-segment n)))
+                                 (when (not (hashtable-ref t seg #f))
+                                   (hashtable-set! t seg n))))
+                             (cons k supers)))
+                 keys vals))
+              (set! jch-simple->fqn-cache t)
+              t)))))
+(define (jch-fqn-of-simple name)
+  (or (hashtable-ref (jch-simple->fqn-table) name #f) name))
+
+;; A register also invalidates the derived caches. The mutation and BOTH resets
+;; are one critical section, and the resets come AFTER the mutation: resetting
+;; first would leave a window where the graph is still the old one, so a
+;; concurrent jch-known-table could rebuild from it and publish, and this
+;; register would then never invalidate what that thread just cached. (The inner
+;; fn takes the same mutex; Chez's are recursive.)
+(define jch-register-supers!-inner jch-register-supers!)
+(set! jch-register-supers!
+  (lambda (name supers)
+    (jolt-with-mutex jch-cache-mutex
+      (jch-register-supers!-inner name supers)
+      (set! jch-known-cache #f)
+      (set! jch-simple->fqn-cache #f)
+      (set! jch-jvm-name-cache #f))
+    (jch-class-registered-hook name)))
+
+;; throw-jvm (rt.ss) resolves an unlisted simple exception name through this graph
+;; now that it exists — so (throw-jvm 'RuntimeException …) reports
+;; java.lang.RuntimeException, not a bare name. rt.ss loads first, so it defaults
+;; the fallback to symbol->string until this point.
+(set! jvm-throwable-fqn-fallback
+  (lambda (sym) (jch-fqn-of-simple (symbol->string sym))))
+
+;; ---- interface marking ---------------------------------------------------------
+;; The JVM distinguishes a concrete class (whose bases/supers chain roots at
+;; Object) from an interface (whose don't). The graph marks the modeled
+;; interfaces; anything unmarked is treated as a concrete class.
+(define jch-interface-set (make-hashtable string-hash string=?))
+;; written at deftype / defprotocol time from whatever thread defines, so the
+;; write is serialized; the read stays unlocked (strong general table)
+;; Object is the one name that can never be an interface, and a deftype's
+;; `Object` method block (toString / equals / hashCode) files it here like any
+;; declared interface — after which .getSuperclass rendered "interface
+;; java.lang.Object" and Object's modifiers grew INTERFACE|ABSTRACT. The guard
+;; is here, at the one write, not at each reader.
+(define (jch-mark-interface! name)
+  (unless (or (string=? name "java.lang.Object") (string=? name "Object"))
+    (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-interface-set name #t))))
+;; an interface the graph marked, or one of java.base's (jdk-interfaces.ss)
+(define (jch-interface? name)
+  (or (hashtable-ref jch-interface-set name #f) (hashtable-ref jdk-public-interfaces name #f)))
+;; a java.* / javax.* / com.sun.* / jdk.* name that is not an interface: a JDK
+;; class, whether or not the graph models it (a proxy over java.util.TimerTask
+;; extends it). The interface table covers the com.sun.* and jdk.* packages
+;; the JDK exports, which are the ones a program can name.
+(define (jch-jdk-class? name)
+  (define (prefix? p) (let ((k (string-length p))) (and (fx>? (string-length name) k) (string=? (substring name 0 k) p))))
+  (and (string? name)
+       (or (prefix? "java.") (prefix? "javax.") (prefix? "com.sun.") (prefix? "jdk."))
+       (not (jch-interface? name))))
+(for-each jch-mark-interface!
+          '("clojure.lang.Seqable" "clojure.lang.Sequential" "clojure.lang.Sorted"
+            "clojure.lang.Reversible" "clojure.lang.Indexed" "clojure.lang.Counted"
+            "clojure.lang.Named" "clojure.lang.Fn" "clojure.lang.IFn"
+            "clojure.lang.IPersistentCollection" "clojure.lang.ISeq"
+            "clojure.lang.IChunkedSeq" "clojure.lang.IChunk" "clojure.lang.IndexedSeq"
+            "clojure.lang.IPending" "clojure.lang.IRef" "clojure.lang.IAtom"
+            "clojure.lang.IAtom2" "clojure.lang.IBlockingDeref" "clojure.lang.IMapEntry"
+            "clojure.lang.Associative" "clojure.lang.ILookup"
+            "clojure.lang.IPersistentStack" "clojure.lang.IPersistentVector"
+            "clojure.lang.IPersistentMap" "clojure.lang.IPersistentSet"
+            "clojure.lang.IPersistentList" "clojure.lang.IObj" "clojure.lang.IMeta" "clojure.lang.IProxy"
+            "clojure.lang.IDeref" "clojure.lang.IRecord" "clojure.lang.IType"
+            "clojure.lang.IHashEq" "clojure.lang.IEditableCollection"
+            "clojure.lang.IReference"
+            "clojure.lang.IExceptionInfo" "clojure.lang.IReduceInit"
+            "java.util.List" "java.util.Set" "java.util.Collection" "java.util.Map"
+            "java.util.Iterator" "java.lang.Iterable" "java.lang.CharSequence"
+            "java.lang.Appendable" "java.lang.Comparable" "java.lang.Runnable"
+            "java.util.concurrent.Callable" "java.io.Serializable"
+            "java.lang.AutoCloseable" "java.io.Closeable" "java.io.Flushable"
+            "java.lang.Readable"
+            ;; interfaces the graph modeled as concrete classes, so .isInterface
+            ;; answered false and .getSuperclass named a supertype where the JVM
+            ;; returns null — java.util.Map$Entry reported clojure.lang.AFunction.
+            ;; Derived by probing the reference JVM for every java.* name this
+            ;; graph models, not by eye.
+            "java.util.Queue" "java.util.Deque" "java.util.Map$Entry"
+            "java.nio.file.Path" "java.nio.file.PathMatcher" "java.nio.file.Watchable"
+            "java.nio.file.DirectoryStream"
+            ;; the typed.clojure rows (probed the same way)
+            "java.util.RandomAccess" "java.util.Comparator" "java.util.SequencedCollection"
+            ;; the one interface java.util.regex.Matcher implements (#998)
+            "java.util.regex.MatchResult"
+            "clojure.lang.ITransientCollection" "clojure.lang.ITransientAssociative"
+            "clojure.lang.ITransientAssociative2" "clojure.lang.ITransientMap"
+            "clojure.lang.ITransientVector" "clojure.lang.ITransientSet"))
+
+;; ---- class modifiers ---------------------------------------------------------
+;; Class.getModifiers is a JVM bitmask; jolt derives it from the graph rather than
+;; from bytecode it does not have. Visibility is PUBLIC unless the class is in the
+;; visibility table below (package-private contributes nothing, private its own
+;; bit); a nested class — a $ in a modeled name — is STATIC unless it is marked
+;; INNER below (an instance-bound or anonymous class, which the JVM reports
+;; without the bit: TreeMap$Values, AbstractMap$2); INTERFACE implies ABSTRACT the
+;; way javac emits it; and FINAL / ABSTRACT / ENUM come from the marks below.
+;;
+;; The lists were derived by probing the reference JVM for every java.* class and
+;; every nested class this graph models (Class/getModifiers on each), so they say
+;; what the JVM says rather than what looked right. A class jolt does not model
+;; reports PUBLIC alone — an honest "I know it is a class and nothing more", not
+;; a claim of non-finality.
+(define jch-mod-public    1)
+(define jch-mod-private   2)
+(define jch-mod-static    8)
+(define jch-mod-final     16)
+(define jch-mod-interface 512)
+(define jch-mod-abstract  1024)
+(define jch-mod-enum      16384)
+(define jch-final-set (make-hashtable string-hash string=?))
+(define jch-abstract-set (make-hashtable string-hash string=?))
+(define jch-enum-set (make-hashtable string-hash string=?))
+(define jch-inner-set (make-hashtable string-hash string=?))
+;; name -> the visibility bits that REPLACE public for that class
+(define jch-visibility-tbl (make-hashtable string-hash string=?))
+(define (jch-mark-final! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-final-set name #t)))
+(define (jch-mark-abstract! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-abstract-set name #t)))
+(define (jch-mark-enum! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-enum-set name #t)))
+(define (jch-mark-inner! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-inner-set name #t)))
+(define (jch-mark-package-private! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-visibility-tbl name 0)))
+(define (jch-mark-private! name)
+  (jolt-with-mutex jch-cache-mutex (hashtable-set! jch-visibility-tbl name jch-mod-private)))
+(define (jch-final? name) (and (hashtable-ref jch-final-set name #f) #t))
+(define (jch-abstract? name)
+  (or (jch-interface? name) (and (hashtable-ref jch-abstract-set name #f) #t)))
+(define (jch-enum? name) (and (hashtable-ref jch-enum-set name #f) #t))
+;; The bitmask for `name`, resolving a simple name to its FQN first so
+;; (.getModifiers String) and (.getModifiers java.lang.String) agree.
+(define (jch-modifiers name)
+  (let ((n (if (jch-known? name) (jch-fqn-of-simple name) name)))
+    (+ (hashtable-ref jch-visibility-tbl n jch-mod-public)
+       (if (and (str-has-dollar? n) (jch-known-exact? n) (not (hashtable-ref jch-inner-set n #f)))
+           jch-mod-static 0)
+       (if (jch-final? n) jch-mod-final 0)
+       (if (jch-interface? n) jch-mod-interface 0)
+       (if (jch-abstract? n) jch-mod-abstract 0)
+       (if (jch-enum? n) jch-mod-enum 0))))
+(for-each jch-mark-final!
+          '(
+            "java.lang.Boolean" "java.lang.Byte" "java.lang.Character"
+            "java.lang.Class" "java.lang.Double" "java.lang.Float"
+            "java.lang.Integer" "java.lang.Long" "java.lang.Math"
+            "java.lang.Short" "java.lang.String" "java.lang.StringBuffer"
+            "java.lang.StringBuilder"
+            "java.lang.System" "java.net.URI" "java.net.URLDecoder"
+            "java.net.URLEncoder" "java.time.DayOfWeek"
+            "java.time.Duration" "java.time.format.DateTimeFormatter" "java.time.Instant"
+            "java.time.LocalDate" "java.time.LocalDateTime" "java.time.LocalTime"
+            "java.time.Month" "java.time.OffsetDateTime" "java.time.OffsetTime"
+            "java.time.Period" "java.time.temporal.ChronoField" "java.time.temporal.ChronoUnit"
+            "java.time.Year" "java.time.YearMonth" "java.time.zone.ZoneRules"
+            "java.time.ZonedDateTime" "java.time.ZoneOffset" "java.util.Base64"
+            "java.util.Locale" "java.util.regex.Matcher" "java.util.regex.Pattern"
+            "java.util.UUID"
+            ;; clojure.lang's final classes, from their declarations
+            "clojure.lang.ChunkBuffer" "clojure.lang.Volatile" "clojure.lang.Reduced"
+            ;; the nested classes, probed: the four transient classes, the two
+            ;; final seq classes, and the Thread.State enum
+            "clojure.lang.PersistentHashMap$TransientHashMap"
+            "clojure.lang.PersistentArrayMap$TransientArrayMap"
+            "clojure.lang.PersistentHashSet$TransientHashSet"
+            "clojure.lang.PersistentVector$TransientVector"
+            "clojure.lang.PersistentVector$ChunkedSeq" "clojure.lang.PersistentHashMap$NodeSeq"
+            "java.lang.Thread$State"
+            ))
+(for-each jch-mark-abstract!
+          '(
+            "clojure.lang.AMapEntry" "clojure.lang.ATransientMap" "clojure.lang.ATransientSet"
+            "java.io.InputStream" "java.io.OutputStream" "java.io.Reader"
+            "java.io.Writer" "java.lang.Number" "java.lang.VirtualMachineError"
+            "java.lang.ProcessBuilder$Redirect" "java.lang.ref.Reference"
+            "java.nio.ByteBuffer" "java.nio.charset.Charset" "java.nio.file.FileSystem"
+            "java.time.Clock" "java.time.ZoneId" "java.util.TimeZone"
+            ))
+;; the ENUM bit is set by java/enums.ss as each enum is declared
+;; the package-private classes the graph models (all nested; probed): the four
+;; transient classes and three of clojure.lang's seq classes
+(for-each jch-mark-package-private!
+          '(
+            "clojure.lang.PersistentHashMap$TransientHashMap"
+            "clojure.lang.PersistentArrayMap$TransientArrayMap"
+            "clojure.lang.PersistentHashSet$TransientHashSet"
+            "clojure.lang.PersistentVector$TransientVector"
+            "clojure.lang.PersistentArrayMap$Seq" "clojure.lang.PersistentHashMap$NodeSeq"
+            "clojure.lang.PersistentList$EmptyList"
+            ))
+(for-each jch-mark-private!
+          '("java.lang.String$CaseInsensitiveComparator"))
+
+;; ---- seed the built-in graph: direct supers only, faithful to the JVM ---------
+;; core clojure.lang interfaces
+(jch-register-supers! "clojure.lang.IPersistentCollection" '("clojure.lang.Seqable"))
+(jch-register-supers! "clojure.lang.ISeq" '("clojure.lang.IPersistentCollection"))
+;; the interface chunk-first / chunk-rest are the contract of — a chunked seq is a
+;; Sequential ISeq that can also hand out a whole block at a time
+(jch-register-supers! "clojure.lang.IChunkedSeq" '("clojure.lang.ISeq" "clojure.lang.Sequential"))
+;; an ISeq that knows its position; a deftype or reify declaring it is a seq
+(jch-register-supers! "clojure.lang.IndexedSeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.Associative" '("clojure.lang.IPersistentCollection" "clojure.lang.ILookup"))
+(jch-register-supers! "clojure.lang.IPersistentStack" '("clojure.lang.IPersistentCollection"))
+(jch-register-supers! "clojure.lang.IPersistentVector" '("clojure.lang.Associative" "clojure.lang.Sequential"
+                                                         "clojure.lang.IPersistentStack" "clojure.lang.Reversible"
+                                                         "clojure.lang.Indexed"))
+(jch-register-supers! "clojure.lang.IPersistentMap" '("java.lang.Iterable" "clojure.lang.Associative" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.Indexed" '("clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.IKVReduce" '())
+(jch-register-supers! "clojure.lang.MapEquivalence" '())
+(jch-register-supers! "clojure.lang.Obj" '("clojure.lang.IObj" "java.io.Serializable"))
+(for-each jch-mark-interface! '("clojure.lang.IKVReduce" "clojure.lang.MapEquivalence"))
+(jch-mark-abstract! "clojure.lang.Obj")
+(jch-register-supers! "clojure.lang.IPersistentSet" '("clojure.lang.IPersistentCollection" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.IPersistentList" '("clojure.lang.Sequential" "clojure.lang.IPersistentStack"))
+(jch-register-supers! "clojure.lang.IObj" '("clojure.lang.IMeta"))
+;; IFn extends Runnable + Callable only; Fn is NOT a super of IFn. Symbols,
+;; keywords and vars are IFn (callable) but must not satisfy Fn — only real
+;; fns do, via AFunction's direct Fn row below.
+(jch-register-supers! "clojure.lang.IFn" '("java.lang.Runnable" "java.util.concurrent.Callable"))
+;; Fn is a marker interface (no supers).
+(jch-register-supers! "clojure.lang.AFn" '("clojure.lang.IFn"))
+;; AFunction implements java.util.Comparator on the JVM — every fn sorts — so
+;; (instance? java.util.Comparator f) and (.compare f a b) hold. Fn stays ahead
+;; of it so an extension on Fn / IFn keeps outranking one on Comparator in the
+;; dispatch order. The JVM's other two direct interfaces, IObj and Serializable,
+;; are NOT here: IObj puts every fn under IMeta for protocol dispatch, a
+;; fleet-wide change that needs the library gate first (jolt-tnt7).
+(jch-register-supers! "clojure.lang.AFunction" '("clojure.lang.AFn" "clojure.lang.IObj" "java.util.Comparator" "clojure.lang.Fn" "java.io.Serializable"))
+;; java.util collection interfaces. JDK 21 put SequencedCollection between
+;; Collection and List / Deque, and the reference oracle runs on it, so List's
+;; ONE direct super is SequencedCollection and Collection arrives transitively.
+;; The shape matters, not just the closure: typed.clojure validates an
+;; annotation's :replace keys against a class's DIRECT bases. RandomAccess and
+;; Comparator are marker-style interfaces with no supers of their own; the rows
+;; below graft them onto the classes the JVM declares them on.
+(jch-register-supers! "java.util.SequencedCollection" '("java.util.Collection"))
+(jch-register-supers! "java.util.List" '("java.util.SequencedCollection"))
+(jch-register-supers! "java.util.Set" '("java.util.Collection"))
+(jch-register-supers! "java.util.Collection" '("java.lang.Iterable"))
+(jch-register-supers! "java.util.RandomAccess" '())
+(jch-register-supers! "java.util.Comparator" '())
+;; jolt has ONE iterator over a seq where the JVM has an inner class per
+;; collection (PersistentVector$2, …), and clojure.lang.SeqIterator is the JVM
+;; class that iterator IS — a seq walked by hasNext/next. Naming it that keeps
+;; (class (.iterator coll)) a real class instead of leaking the :object
+;; taxonomy keyword, and (SeqIterator. s) then reports the same class the JVM
+;; gives it. Iterator's own row is empty so it is a graph node, not an
+;; unregistered name.
+(jch-register-supers! "java.util.Iterator" '())
+(jch-register-supers! "clojure.lang.SeqIterator" '("java.util.Iterator"))
+;; Serializable is a marker too. Its rows below sit exactly where the JVM
+;; declares it — on Number, on the wrapper classes that are not Numbers, and on
+;; the abstract Clojure collection classes — so every concrete class inherits it
+;; instead of restating it, and (bases Long) stays what the JVM reports.
+(jch-register-supers! "java.io.Serializable" '())
+;; concrete collection classes
+;; AFn and IHashEq close each abstract collection row, after the interfaces the
+;; rows have always listed, so a protocol extended to both IPersistentMap and IFn
+;; keeps dispatching a map to IPersistentMap.
+(jch-register-supers! "clojure.lang.APersistentVector" '("clojure.lang.IPersistentVector" "java.lang.Iterable" "java.util.List" "java.util.RandomAccess" "java.lang.Comparable" "java.io.Serializable"
+                                                         "clojure.lang.AFn" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.PersistentVector" '("clojure.lang.APersistentVector" "clojure.lang.IObj"
+                                                        "java.util.List" "java.lang.Comparable"
+                                                        "clojure.lang.IReduce" "clojure.lang.IKVReduce"))
+;; subvec's view class (issue #629): an APersistentVector, so every vector
+;; check holds; not a PersistentVector, so concrete-class dispatch doesn't
+(jch-register-supers! "clojure.lang.APersistentVector$SubVector"
+                      '("clojure.lang.APersistentVector" "clojure.lang.IObj"
+                        "java.util.List" "java.lang.Comparable" "clojure.lang.IKVReduce"))
+(jch-register-supers! "clojure.lang.APersistentMap" '("clojure.lang.IPersistentMap" "java.util.Map" "java.lang.Iterable" "java.io.Serializable"
+                                                      "clojure.lang.MapEquivalence" "clojure.lang.AFn" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.PersistentArrayMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj" "clojure.lang.IKVReduce"))
+(jch-register-supers! "clojure.lang.PersistentHashMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj" "clojure.lang.IKVReduce"))
+(jch-register-supers! "clojure.lang.PersistentTreeMap" '("clojure.lang.APersistentMap" "clojure.lang.IObj" "clojure.lang.Sorted" "clojure.lang.Reversible"
+                                                         "clojure.lang.IKVReduce"))
+(jch-register-supers! "clojure.lang.APersistentSet" '("clojure.lang.IPersistentSet" "java.util.Collection" "java.util.Set" "java.io.Serializable"
+                                                      "clojure.lang.AFn" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.PersistentHashSet" '("clojure.lang.APersistentSet" "clojure.lang.IObj"))
+(jch-register-supers! "clojure.lang.PersistentTreeSet" '("clojure.lang.APersistentSet" "clojure.lang.IObj" "clojure.lang.Sorted" "clojure.lang.Reversible"))
+(jch-register-supers! "clojure.lang.ASeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "java.io.Serializable"
+                                             "clojure.lang.Obj" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.PersistentList" '("clojure.lang.ASeq" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.Counted"
+                                                      "clojure.lang.IReduce"))
+;; EmptyList is a static nested class of PersistentList, not a subclass: it
+;; extends Obj and implements the list interfaces itself, so () is not a
+;; PersistentList, an ASeq or an IReduce, and a protocol extended to either does
+;; not reach it.
+(jch-register-supers! "clojure.lang.PersistentList$EmptyList"
+                      '("clojure.lang.Obj" "clojure.lang.IPersistentList" "java.util.List" "clojure.lang.ISeq"
+                        "clojure.lang.Counted" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.LazySeq" '("clojure.lang.ISeq" "clojure.lang.Sequential" "java.util.List" "clojure.lang.IObj"
+                                                 "clojure.lang.Obj" "clojure.lang.IHashEq"))
+(jch-register-supers! "clojure.lang.Cons" '("clojure.lang.ASeq"))
+;; ---- the concrete seq classes -------------------------------------------------
+;; One record backs every seq on this host, so which of these a value IS comes from
+;; the cell's flavor tag (seq.ss sk-*, mapped to these names in host-class.ss).
+;; Each row lists what the JVM class extends, MINUS any interface jolt does not
+;; actually honor for that flavor — the graph answers instance?, counted?,
+;; ancestors and protocol dispatch alike, so a row that overclaims turns one wrong
+;; answer into four. Each omission is called out where it happens.
+;;
+;; IChunkedSeq is NOT listed on any row here. Which flavors chunk is stated once, by
+;; sk-chunked? in seq.ss (the tier that implements chunk-first/chunk-rest), and
+;; host-class.ss grafts the interface onto exactly those flavors' classes — so
+;; chunked-seq? and (instance? IChunkedSeq x) cannot answer differently.
+;;
+;; A vector's own seq: Counted is real here — jolt-count reads (pvec-count - ci)
+;; without walking, exactly what Counted promises (collections.ss jolt-count).
+(jch-register-supers! "clojure.lang.PersistentVector$ChunkedSeq"
+                      '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
+;; A standalone chunk plus an arbitrary, possibly lazy rest. NOT Counted — its
+;; length is unknown without forcing, and ChunkedCons is not Counted on the JVM either.
+(jch-register-supers! "clojure.lang.ChunkedCons" '("clojure.lang.ASeq"))
+;; Array and string seqs and a vector's rseq are counted cells (seq.ss cseqn):
+;; each knows how many elements it heads, so jolt-count answers them without
+;; walking, as Counted promises — the JVM's ArraySeq and StringSeq are Counted
+;; through IndexedSeq, and RSeq directly. IndexedSeq itself is not claimed: it
+;; also promises index(), which nothing here answers.
+(jch-register-supers! "clojure.lang.ArraySeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce"))
+(for-each (lambda (prim) (jch-register-supers! (string-append "clojure.lang.ArraySeq$ArraySeq_" prim)
+                                               '("clojure.lang.ArraySeq")))
+          '("int" "long" "short" "double" "float" "boolean" "byte" "char"))
+;; StringSeq reduces itself only from an init: IReduceInit, not IReduce
+(jch-register-supers! "clojure.lang.StringSeq" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduceInit"))
+(jch-register-supers! "clojure.lang.APersistentVector$RSeq" '("clojure.lang.ASeq" "clojure.lang.Counted"))
+;; The map/set seq views. PersistentArrayMap$Seq is Counted on the JVM; jolt
+;; materializes it into a cell chain, so it is not claimed here either.
+(jch-register-supers! "clojure.lang.PersistentArrayMap$Seq" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
+(jch-register-supers! "clojure.lang.PersistentHashMap$NodeSeq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.PersistentTreeMap$Seq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.APersistentMap$KeySeq" '("clojure.lang.ASeq"))
+(jch-register-supers! "clojure.lang.APersistentMap$ValSeq" '("clojure.lang.ASeq"))
+;; A bounded range chunks by 32 like the JVM's (sk-chunked? says so, and the
+;; interface is grafted on from there). Counted, as the JVM's is: jolt-count
+;; answers a range from its first chunk and the bounds its lazy continuation
+;; holds (seq.ss range-rest-count), without realizing anything. Once later chunks
+;; HAVE been realized it steps to the first unrealized one, 32 elements a step.
+(jch-register-supers! "clojure.lang.LongRange" '("clojure.lang.ASeq" "clojure.lang.Counted" "clojure.lang.IReduce" "clojure.lang.IDrop"))
+;; The non-all-longs range — (range 0 1.0 0.1) and friends. Same shape as
+;; LongRange, and chunked for the same reason.
+(jch-register-supers! "clojure.lang.Range" '("clojure.lang.ASeq" "clojure.lang.IReduce"))
+;; iterate (and the unbounded range) and cycle are IPending — realized? answers
+;; for their first cell — and reduce themselves (IReduce), as on the JVM.
+(jch-register-supers! "clojure.lang.Iterate" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
+(jch-register-supers! "clojure.lang.Cycle" '("clojure.lang.ASeq" "clojure.lang.IPending" "clojure.lang.IReduce"))
+;; (range start end 0), which the JVM answers with Repeat.create(start). Lazy and
+;; unbounded, so not chunked and not Counted.
+(jch-register-supers! "clojure.lang.Repeat" '("clojure.lang.ASeq" "clojure.lang.IReduce" "clojure.lang.IDrop"))
+;; IReduce is IReduceInit's two-arity extension; IDrop is drop's fast path (1.12).
+(jch-register-supers! "clojure.lang.IReduce" '("clojure.lang.IReduceInit"))
+(jch-mark-interface! "clojure.lang.IReduce")
+(jch-register-supers! "clojure.lang.IDrop" '())
+(jch-mark-interface! "clojure.lang.IDrop")
+(jch-register-supers! "clojure.lang.PersistentQueue" '("clojure.lang.IPersistentList" "clojure.lang.IPersistentCollection" "java.util.Collection"))
+;; the reader's two literal wrappers: lookups on :tag/:form and :form/:splicing?
+(jch-register-supers! "clojure.lang.TaggedLiteral" '("clojure.lang.ILookup"))
+(jch-register-supers! "clojure.lang.ReaderConditional" '("clojure.lang.ILookup"))
+;; scalars / named / callable
+(jch-register-supers! "clojure.lang.Keyword" '("clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.Symbol" '("clojure.lang.IObj" "clojure.lang.IFn" "clojure.lang.Named" "java.lang.Comparable" "java.io.Serializable"))
+;; The reference types extend ARef, which implements IRef — so each IS an IRef,
+;; not just an IDeref (IRef extends IDeref, so that still holds transitively).
+;; An atom is also the IAtom2 swap/reset surface; Ref and Var are callable.
+;; ARef is a row of its own rather than a collapsed edge to IRef: a consumer that
+;; reads a class's DIRECT bases (typed.clojure validates an annotation's :replace
+;; keys against them) is told what the class extends, and every one of these
+;; extends ARef.
+(jch-register-supers! "clojure.lang.IReference" '("clojure.lang.IMeta"))
+(jch-register-supers! "clojure.lang.AReference" '("clojure.lang.IReference"))
+;; Clojure 1.12: IDeref extends the five java.util.function suppliers, so every
+;; reference type (atom, delay, future, promise, var, volatile, reduced) is a
+;; Supplier — (.get (atom 1)) and (instance? Supplier (delay 1)).
+(jch-register-supers! "clojure.lang.IDeref"
+  '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+    "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+    "java.util.function.DoubleSupplier"))
+;; The java.util.function interfaces themselves, so a reify of one is an instance
+;; of it, a ^Predicate / ^Function hint resolves to its FQN (the analyzer's
+;; functional-interface coercion of a hinted let binding reads that), and an
+;; :import of one names a class jolt models. UnaryOperator and BinaryOperator
+;; extend Function and BiFunction, as in the JDK.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.function.Supplier" "java.util.function.BooleanSupplier"
+            "java.util.function.IntSupplier" "java.util.function.LongSupplier"
+            "java.util.function.DoubleSupplier"
+            "java.util.function.Function" "java.util.function.BiFunction"
+            "java.util.function.IntFunction" "java.util.function.LongFunction"
+            "java.util.function.DoubleFunction"
+            "java.util.function.Predicate" "java.util.function.BiPredicate"
+            "java.util.function.IntPredicate" "java.util.function.LongPredicate"
+            "java.util.function.DoublePredicate"
+            "java.util.function.Consumer" "java.util.function.BiConsumer"
+            "java.util.function.IntConsumer" "java.util.function.LongConsumer"
+            "java.util.function.DoubleConsumer" "java.util.function.ObjIntConsumer"
+            "java.util.function.ObjLongConsumer" "java.util.function.ObjDoubleConsumer"
+            "java.util.function.ToIntFunction" "java.util.function.ToLongFunction"
+            "java.util.function.ToDoubleFunction" "java.util.function.ToIntBiFunction"
+            "java.util.function.ToLongBiFunction" "java.util.function.ToDoubleBiFunction"
+            "java.util.function.IntUnaryOperator" "java.util.function.LongUnaryOperator"
+            "java.util.function.DoubleUnaryOperator" "java.util.function.IntBinaryOperator"
+            "java.util.function.LongBinaryOperator" "java.util.function.DoubleBinaryOperator"
+            "java.util.function.IntToLongFunction" "java.util.function.IntToDoubleFunction"
+            "java.util.function.LongToIntFunction" "java.util.function.LongToDoubleFunction"
+            "java.util.function.DoubleToIntFunction" "java.util.function.DoubleToLongFunction"))
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.io.FileFilter" "java.io.FilenameFilter"))
+(jch-register-supers! "java.util.function.UnaryOperator" '("java.util.function.Function"))
+(jch-mark-interface! "java.util.function.UnaryOperator")
+(jch-register-supers! "java.util.function.BinaryOperator" '("java.util.function.BiFunction"))
+(jch-mark-interface! "java.util.function.BinaryOperator")
+(jch-register-supers! "clojure.lang.IRef" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.ARef" '("clojure.lang.AReference" "clojure.lang.IRef"))
+(jch-register-supers! "clojure.lang.IAtom" '())
+(jch-register-supers! "clojure.lang.IAtom2" '("clojure.lang.IAtom"))
+(jch-register-supers! "clojure.lang.Atom" '("clojure.lang.ARef" "clojure.lang.IAtom2"))
+(jch-register-supers! "clojure.lang.Ref" '("clojure.lang.ARef" "clojure.lang.IRef" "clojure.lang.IFn" "java.lang.Comparable"))
+(jch-register-supers! "clojure.lang.Var" '("clojure.lang.ARef" "clojure.lang.IRef" "clojure.lang.IFn" "java.io.Serializable"))
+(jch-register-supers! "clojure.lang.Agent" '("clojure.lang.ARef"))
+;; the boxes: Volatile and Reduced are plain derefs, a Delay is a pending one.
+;; IBlockingDeref is the timed deref a promise or future answers (their reify
+;; classes register in concurrency.ss, beside the values that carry them).
+(jch-register-supers! "clojure.lang.IBlockingDeref" '())
+(jch-register-supers! "clojure.lang.Volatile" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.Reduced" '("clojure.lang.IDeref"))
+(jch-register-supers! "clojure.lang.Delay" '("clojure.lang.IDeref" "clojure.lang.IPending"))
+(jch-register-supers! "clojure.lang.Ratio" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "clojure.lang.BigInt" '("java.lang.Number"))
+(jch-register-supers! "java.lang.String" '("java.lang.CharSequence" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.lang.Long" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.Integer" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.Double" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.Float" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.math.BigDecimal" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.math.BigInteger" '("java.lang.Number" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.Boolean" '("java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.lang.Character" '("java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.util.UUID" '("java.lang.Comparable" "java.io.Serializable"))
+;; exception hierarchy (folds in the former exception-parent table)
+(jch-register-supers! "java.lang.Exception" '("java.lang.Throwable"))
+(jch-register-supers! "java.lang.RuntimeException" '("java.lang.Exception"))
+(jch-register-supers! "clojure.lang.ExceptionInfo" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+;; what load-string / load-file raise for a form whose run threw (compile-eval.ss)
+(jch-register-supers! "clojure.lang.Compiler$CompilerException" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+;; what a read from a LineNumberingPushbackReader raises (reader.ss
+;; rdr-reader-exception); only the LispReader one carries ex-data
+(jch-register-supers! "clojure.lang.LispReader$ReaderException" '("java.lang.RuntimeException" "clojure.lang.IExceptionInfo"))
+(jch-register-supers! "clojure.lang.EdnReader$ReaderException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IllegalArgumentException" '("java.lang.RuntimeException"))
+(jch-register-supers! "clojure.lang.ArityException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.lang.NumberFormatException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.util.regex.PatternSyntaxException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.util.IllegalFormatException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.util.IllegalFormatConversionException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.UnknownFormatConversionException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.MissingFormatArgumentException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.MissingFormatWidthException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatPrecisionException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatWidthException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatFlagsException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatArgumentIndexException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.DuplicateFormatFlagsException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.IllegalFormatCodePointException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.util.FormatFlagsConversionMismatchException" '("java.util.IllegalFormatException"))
+(jch-register-supers! "java.lang.IllegalStateException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.UnsupportedOperationException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.ArithmeticException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.NullPointerException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.ClassCastException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IndexOutOfBoundsException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.util.ConcurrentModificationException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.util.NoSuchElementException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.io.UncheckedIOException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.util.concurrent.RejectedExecutionException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.util.concurrent.ExecutionException" '("java.lang.Exception"))
+;; The other three java.util.concurrent exceptions a caller constructs or matches
+;; on. TimeoutException was already thrown by the runtime (a timed Future.get, an
+;; invokeAny) and a catch naming it matched, but with no row here the ctor sweep
+;; gave it no constructor and it did not answer instance? Exception.
+(jch-register-supers! "java.util.concurrent.TimeoutException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.BrokenBarrierException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.CompletionException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.time.DateTimeException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.time.format.DateTimeParseException" '("java.time.DateTimeException"))
+(jch-register-supers! "java.time.temporal.UnsupportedTemporalTypeException" '("java.time.DateTimeException"))
+(jch-register-supers! "java.time.zone.ZoneRulesException" '("java.time.DateTimeException"))
+(jch-register-supers! "java.text.ParseException" '("java.lang.Exception"))
+(jch-register-supers! "java.lang.InterruptedException" '("java.lang.Exception"))
+(jch-register-supers! "java.io.IOException" '("java.lang.Exception"))
+(jch-register-supers! "java.io.InterruptedIOException" '("java.io.IOException"))
+(jch-register-supers! "java.io.FileNotFoundException" '("java.io.IOException"))
+(jch-register-supers! "java.io.UnsupportedEncodingException" '("java.io.IOException"))
+(jch-register-supers! "java.io.EOFException" '("java.io.IOException"))
+;; java.util.zip's exception classes (JDK 21 ZipException.java,
+;; DataFormatException.java). Here, before host-static-classes.ss, so its
+;; Throwable sweep gives them constructors.
+(jch-register-supers! "java.util.zip.ZipException" '("java.io.IOException"))
+(jch-register-supers! "java.util.zip.DataFormatException" '("java.lang.Exception"))
+(jch-register-supers! "java.nio.file.FileSystemException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.file.FileAlreadyExistsException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.NoSuchFileException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.AccessDeniedException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.NotDirectoryException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.NotLinkException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.DirectoryNotEmptyException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.AtomicMoveNotSupportedException" '("java.nio.file.FileSystemException"))
+(jch-register-supers! "java.nio.file.FileSystemNotFoundException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.FileSystemAlreadyExistsException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.ProviderNotFoundException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.file.ProviderMismatchException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.InvalidPathException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.file.ClosedFileSystemException" '("java.lang.IllegalStateException"))
+(jch-register-supers! "java.nio.file.ClosedWatchServiceException" '("java.lang.IllegalStateException"))
+(jch-register-supers! "java.nio.file.ReadOnlyFileSystemException" '("java.lang.UnsupportedOperationException"))
+(jch-register-supers! "java.nio.channels.ClosedChannelException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.channels.SeekableByteChannel" '("java.nio.channels.Channel"))
+(jch-mark-interface! "java.nio.channels.SeekableByteChannel")
+(jch-register-supers! "java.nio.channels.FileChannel" '("java.nio.channels.SeekableByteChannel"))
+(jch-register-supers! "java.net.JarURLConnection" '("java.net.URLConnection"))
+(jch-register-supers! "java.net.UnknownHostException" '("java.io.IOException"))
+(jch-register-supers! "java.net.SocketException" '("java.io.IOException"))
+(jch-register-supers! "java.net.ConnectException" '("java.net.SocketException"))
+(jch-register-supers! "java.net.BindException" '("java.net.SocketException"))
+(jch-register-supers! "java.net.NoRouteToHostException" '("java.net.SocketException"))
+(jch-register-supers! "java.net.PortUnreachableException" '("java.net.SocketException"))
+(jch-register-supers! "java.net.ProtocolException" '("java.io.IOException"))
+(jch-register-supers! "java.net.SocketTimeoutException" '("java.io.InterruptedIOException"))
+(jch-register-supers! "java.net.MalformedURLException" '("java.io.IOException"))
+(jch-register-supers! "java.net.URISyntaxException" '("java.lang.Exception"))
+(jch-register-supers! "javax.net.ssl.SSLException" '("java.io.IOException"))
+;; java.net.http: the two exceptions a java.net.http caller raises or matches on.
+;; Both are plain IOException subclasses on the JDK, and host-static-classes.ss's
+;; ctor sweep derives (HttpTimeoutException. "msg") from these rows — the class
+;; token already resolved and catch already matched, so only construction was
+;; missing (jolt#950).
+(jch-register-supers! "java.net.http.HttpTimeoutException" '("java.io.IOException"))
+(jch-register-supers! "java.net.http.HttpConnectTimeoutException" '("java.net.http.HttpTimeoutException"))
+(jch-register-supers! "java.nio.charset.UnsupportedCharsetException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.nio.charset.IllegalCharsetNameException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.io.CharConversionException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.charset.CharacterCodingException" '("java.io.IOException"))
+(jch-register-supers! "java.nio.charset.MalformedInputException" '("java.nio.charset.CharacterCodingException"))
+(jch-register-supers! "java.nio.charset.UnmappableCharacterException" '("java.nio.charset.CharacterCodingException"))
+(jch-register-supers! "java.nio.BufferOverflowException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.nio.BufferUnderflowException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.Error" '("java.lang.Throwable"))
+(jch-register-supers! "java.lang.AssertionError" '("java.lang.Error"))
+;; what a transaction throws to retry itself (refs.ss): an Error, past (catch Exception e)
+(jch-register-supers! "clojure.lang.LockingTransaction$RetryEx" '("java.lang.Error"))
+(jch-register-supers! "java.lang.ArrayIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
+(jch-register-supers! "java.lang.StringIndexOutOfBoundsException" '("java.lang.IndexOutOfBoundsException"))
+(jch-register-supers! "java.lang.ReflectiveOperationException" '("java.lang.Exception"))
+(jch-register-supers! "java.lang.ClassNotFoundException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.NoSuchMethodException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.NoSuchFieldException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.IllegalAccessException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.CloneNotSupportedException" '("java.lang.Exception"))
+(jch-register-supers! "java.util.concurrent.CancellationException" '("java.lang.IllegalStateException"))
+(jch-register-supers! "java.sql.SQLException" '("java.lang.Exception"))
+(jch-register-supers! "java.sql.BatchUpdateException" '("java.sql.SQLException"))
+;; The rest of the java.sql.SQLException family JDBC drivers throw (next.jdbc
+;; code catches these by name). Every one takes SQLException's
+;; (reason, SQLState, vendorCode, cause) ctors, which host-static-classes.ss
+;; registers for everything that is-a SQLException.
+(jch-register-supers! "java.sql.SQLWarning" '("java.sql.SQLException"))
+(jch-register-supers! "java.sql.SQLTransientException" '("java.sql.SQLException"))
+(jch-register-supers! "java.sql.SQLNonTransientException" '("java.sql.SQLException"))
+(jch-register-supers! "java.sql.SQLRecoverableException" '("java.sql.SQLException"))
+(jch-register-supers! "java.sql.SQLTimeoutException" '("java.sql.SQLTransientException"))
+(jch-register-supers! "java.sql.SQLTransactionRollbackException" '("java.sql.SQLTransientException"))
+(jch-register-supers! "java.sql.SQLTransientConnectionException" '("java.sql.SQLTransientException"))
+(jch-register-supers! "java.sql.SQLNonTransientConnectionException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.sql.SQLDataException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.sql.SQLFeatureNotSupportedException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.sql.SQLIntegrityConstraintViolationException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.sql.SQLInvalidAuthorizationSpecException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.sql.SQLSyntaxErrorException" '("java.sql.SQLNonTransientException"))
+(jch-register-supers! "java.lang.LinkageError" '("java.lang.Error"))
+(jch-register-supers! "java.lang.ClassCircularityError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.IncompatibleClassChangeError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.AbstractMethodError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.IllegalAccessError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.NoClassDefFoundError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.UnsatisfiedLinkError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.VirtualMachineError" '("java.lang.Error"))
+(jch-register-supers! "java.lang.InternalError" '("java.lang.VirtualMachineError"))
+(jch-register-supers! "java.lang.OutOfMemoryError" '("java.lang.VirtualMachineError"))
+(jch-register-supers! "java.lang.StackOverflowError" '("java.lang.VirtualMachineError"))
+(jch-register-supers! "java.lang.ThreadDeath" '("java.lang.Error"))
+(jch-register-supers! "java.lang.Thread" '("java.lang.Runnable"))
+(jch-register-supers! "java.io.IOError" '("java.lang.Error"))
+;; leaf/root classes with only Object as super
+(jch-register-supers! "java.lang.Object" '())
+(jch-register-supers! "java.lang.Class" '())
+(jch-register-supers! "java.lang.Throwable" '())
+;; java.lang.reflect — the member objects Class.getDeclaredFields / getMethods /
+;; getConstructors hand back (java/natives-array.ss, java/host-static-classes.ss).
+;; The JVM's own shape: Member is the interface all three implement, Executable
+;; the abstract class Method and Constructor share, AccessibleObject the root of
+;; all of them. Without these rows the member values reported (class m) => :object
+;; and printed as #object[:object], which is all a caller ever saw of them.
+(jch-register-supers! "java.lang.reflect.Member" '())
+(jch-mark-interface! "java.lang.reflect.Member")
+(jch-register-supers! "java.lang.reflect.AccessibleObject" '())
+(jch-register-supers! "java.lang.reflect.Executable"
+                      '("java.lang.reflect.AccessibleObject" "java.lang.reflect.Member"))
+(jch-register-supers! "java.lang.reflect.Method" '("java.lang.reflect.Executable"))
+(jch-register-supers! "java.lang.reflect.Constructor" '("java.lang.reflect.Executable"))
+(jch-register-supers! "java.lang.reflect.Field"
+                      '("java.lang.reflect.AccessibleObject" "java.lang.reflect.Member"))
+;; statics-only shims (no value ever carries these tags, so the rows cannot
+;; shift protocol dispatch) — present so Class.getSuperclass answers Object
+;; as the JVM does, jolt-of08.8
+(jch-register-supers! "java.lang.Math" '())
+(jch-register-supers! "java.lang.System" '())
+(jch-register-supers! "java.lang.Byte" '("java.lang.Number"))
+(jch-register-supers! "java.lang.Short" '("java.lang.Number"))
+;; java.lang.AutoCloseable / java.io.Closeable / java.io.Flushable — the
+;; interfaces the stream taxonomy actually implements. with-open and every
+;; (instance? java.io.Closeable x) branch reads them, and a stream that reported
+;; no interface at all answered false to a question the JVM answers true.
+(jch-register-supers! "java.lang.AutoCloseable" '())
+(jch-register-supers! "java.io.Closeable" '("java.lang.AutoCloseable"))
+(jch-register-supers! "java.io.Flushable" '())
+(jch-register-supers! "java.io.InputStream" '("java.io.Closeable"))
+(jch-register-supers! "java.io.OutputStream" '("java.io.Closeable" "java.io.Flushable"))
+;; The concrete stream classes jolt constructs (io-streams.ss). Each modeled
+;; one is a row here, so isa?/supers on the class token and a protocol
+;; extended to the class both answer — a constructor with no row left
+;; (isa? java.io.FileInputStream java.io.InputStream) false and (supers …) nil.
+(jch-register-supers! "java.io.FileInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.io.ByteArrayInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.io.PipedInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.io.FilterInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.io.BufferedInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.io.PushbackInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.io.SequenceInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.io.FileOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.io.ByteArrayOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.io.PipedOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.io.BufferedOutputStream" '("java.io.FilterOutputStream"))
+(jch-register-supers! "java.io.Reader" '("java.io.Closeable" "java.lang.Readable"))
+(jch-register-supers! "java.lang.Readable" '())
+(jch-register-supers! "java.io.Writer" '("java.io.Closeable" "java.io.Flushable" "java.lang.Appendable"))
+(jch-register-supers! "java.io.File" '("java.io.Serializable" "java.lang.Comparable"))
+(jch-register-supers! "java.io.StringReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.FilterReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.PushbackReader" '("java.io.FilterReader"))
+;; the classes Files.newInputStream/newOutputStream and Process's streams are
+;; (JDK 21; the Windows ProcessImpl answers buffered streams over its pipes)
+(jch-register-supers! "sun.nio.ch.ChannelInputStream" '("java.io.InputStream"))
+(jch-register-supers! "sun.nio.ch.ChannelOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeInputStream" '("java.io.BufferedInputStream"))
+(jch-register-supers! "java.lang.ProcessImpl$ProcessPipeOutputStream" '("java.io.BufferedOutputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.lang.ProcessBuilder$NullOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "clojure.lang.LineNumberingPushbackReader" '("java.io.PushbackReader"))
+(jch-register-supers! "java.io.PrintWriter" '("java.io.Writer"))
+;; System/out and System/err are PrintStreams — byte streams, not the PrintWriter
+;; *out* is. Ported code branches on that (instance? java.io.PrintStream x) and
+;; hands them to anything taking an OutputStream.
+(jch-register-supers! "java.io.FilterOutputStream" '("java.io.OutputStream"))
+(jch-register-supers! "java.io.PrintStream" '("java.io.FilterOutputStream" "java.lang.Appendable"))
+;; java.util.zip (host/chez/java/zlib.ss and zip-*.ss implement them; JDK 21
+;; class declarations).
+(jch-register-supers! "java.util.zip.Checksum" '())
+(jch-mark-interface! "java.util.zip.Checksum")
+(jch-register-supers! "java.util.zip.CRC32" '("java.util.zip.Checksum"))
+(jch-register-supers! "java.util.zip.Adler32" '("java.util.zip.Checksum"))
+(jch-register-supers! "java.util.zip.Inflater" '())
+(jch-register-supers! "java.util.zip.Deflater" '())
+(jch-register-supers! "java.util.zip.ZipEntry" '("java.lang.Cloneable"))
+(jch-register-supers! "java.util.jar.JarEntry" '("java.util.zip.ZipEntry"))
+(jch-register-supers! "java.util.jar.JarFile$JarFileEntry" '("java.util.jar.JarEntry"))
+(jch-register-supers! "java.util.jar.JarFile" '("java.util.zip.ZipFile"))
+(jch-register-supers! "java.util.jar.Attributes" '("java.util.Map" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.jar.Manifest" '("java.lang.Cloneable"))
+(jch-register-supers! "java.util.zip.InflaterInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.util.zip.DeflaterInputStream" '("java.io.FilterInputStream"))
+(jch-register-supers! "java.util.zip.GZIPInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.ZipInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.ZipFile" '("java.io.Closeable"))
+;; the two stream classes ZipFile.getInputStream answers with (ZipFile.java)
+(jch-register-supers! "java.util.zip.ZipFile$ZipFileInputStream" '("java.io.InputStream"))
+(jch-register-supers! "java.util.zip.ZipFile$ZipFileInflaterInputStream" '("java.util.zip.InflaterInputStream"))
+(jch-register-supers! "java.util.zip.DeflaterOutputStream" '("java.io.FilterOutputStream"))
+(jch-register-supers! "java.util.zip.GZIPOutputStream" '("java.util.zip.DeflaterOutputStream"))
+(jch-register-supers! "java.util.zip.ZipOutputStream" '("java.util.zip.DeflaterOutputStream"))
+(jch-register-supers! "java.io.OutputStreamWriter" '("java.io.Writer"))
+(jch-register-supers! "java.io.FileWriter" '("java.io.OutputStreamWriter"))
+(jch-register-supers! "java.io.InputStreamReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.FileReader" '("java.io.InputStreamReader"))
+(jch-register-supers! "java.io.BufferedReader" '("java.io.Reader"))
+(jch-register-supers! "java.io.BufferedWriter" '("java.io.Writer"))
+(jch-register-supers! "java.io.StringWriter" '("java.io.Writer"))
+;; StringBuilder is a CharSequence and an Appendable, which is what lets count/seq/
+;; nth and the regex entry points take one the way they take a String.
+;; Comparable<StringBuilder> since JDK 11, like StringBuffer below
+(jch-register-supers! "java.lang.StringBuilder" '("java.lang.CharSequence" "java.lang.Appendable" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.Appendable" '())
+(jch-register-supers! "java.util.StringTokenizer" '())
+(jch-register-supers! "java.nio.charset.Charset" '())
+(jch-register-supers! "java.nio.CharBuffer" '("java.nio.Buffer" "java.lang.Comparable" "java.lang.CharSequence" "java.lang.Appendable" "java.lang.Readable"))
+(jch-register-supers! "java.nio.charset.CharsetDecoder" '())
+(jch-register-supers! "java.nio.charset.CharsetEncoder" '())
+(jch-register-supers! "java.nio.charset.CoderResult" '())
+(jch-register-supers! "java.nio.charset.CodingErrorAction" '())
+(jch-register-supers! "java.util.Base64" '())
+;; MapEntry extends AMapEntry: an APersistentVector that is also an IMapEntry, the
+;; clojure.lang view of java.util.Map.Entry — so the vector checks and
+;; (instance? java.util.Map$Entry e) (orchard.print) both hold through one chain.
+(jch-register-supers! "clojure.lang.IMapEntry" '("java.util.Map$Entry"))
+(jch-register-supers! "clojure.lang.AMapEntry" '("clojure.lang.APersistentVector" "clojure.lang.IMapEntry"))
+(jch-register-supers! "clojure.lang.MapEntry" '("clojure.lang.AMapEntry"))
+(jch-register-supers! "java.util.Map$Entry" '())
+;; chunk building: a ChunkBuffer is Counted, and IChunk — the block chunk seals
+;; one into on the JVM — is Indexed. jolt seals a chunk into a plain vector, so
+;; nothing here is an IChunk (known-divergences, :seq-type-model).
+(jch-register-supers! "clojure.lang.ChunkBuffer" '("clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.IChunk" '("clojure.lang.Indexed"))
+(jch-register-supers! "clojure.lang.Namespace" '("java.io.Serializable"))
+(jch-register-supers! "java.util.regex.Pattern" '("java.io.Serializable"))
+;; The matcher's BEHAVIOR was complete (re-matcher/.find/.group/.region over
+;; matcher-t, host/chez/regex.ss, #906/#907) but the type had no NAME: (class m)
+;; was :object, instance? was false, and SCI could not analyze a source that
+;; imports or hints Matcher — which clojure.tools.reader's commons.clj does, so
+;; the whole tools.reader family (rewrite-clj, edamame, cljfmt) was unloadable
+;; under SCI. Matcher is final and implements MatchResult; the value arms that
+;; make a matcher-t ANSWER the name are in host-class.ss (class), protocols.ss
+;; (protocol dispatch) and records-interop.ss (instance?). #998.
+(jch-register-supers! "java.util.regex.MatchResult" '())
+(jch-register-supers! "java.util.regex.Matcher" '("java.util.regex.MatchResult"))
+(jch-register-supers! "java.net.URI" '())
+;; The two www-form-urlencoded utility classes. Their statics have worked since
+;; #83 (host-static-classes.ss), but nothing put the NAMES in the graph, so
+;; Class/forName, :import, a type hint and instance? all missed them while the
+;; compiled static call worked — and SCI, which resolves the qualifier of
+;; java.net.URLDecoder/decode as a classname first, could not reach the static at
+;; all (kmet's lsp-adapter). Both are final utility classes whose only super is
+;; Object, like java.util.Base64. #999.
+(jch-register-supers! "java.net.URLEncoder" '())
+(jch-register-supers! "java.net.URLDecoder" '())
+(jch-register-supers! "java.util.ArrayList" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.Arrays$ArrayList" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.Queue" '("java.util.Collection"))
+;; the two blocking queues concurrency.ss models: without a row here they were
+;; no BlockingQueue, Queue or Collection to instance?, so a (satisfies-ish) check
+;; a port makes before .put/.take refused the real thing
+(jch-register-supers! "java.util.concurrent.BlockingQueue" '("java.util.Queue"))
+(jch-register-supers! "java.util.AbstractQueue" '("java.util.AbstractCollection" "java.util.Queue"))
+(jch-register-supers! "java.util.concurrent.ArrayBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.LinkedBlockingQueue"
+  '("java.util.AbstractQueue" "java.util.concurrent.BlockingQueue" "java.io.Serializable"))
+(jch-register-supers! "java.util.Deque" '("java.util.Queue" "java.util.SequencedCollection"))
+(jch-register-supers! "java.util.LinkedList" '("java.util.List" "java.util.Deque"))
+(jch-register-supers! "java.util.ArrayDeque" '("java.util.Deque"))
+(jch-register-supers! "java.util.HashMap" '("java.util.Map"))
+(jch-register-supers! "java.util.concurrent.ConcurrentMap" '("java.util.Map"))
+(jch-register-supers! "java.util.WeakHashMap" '("java.util.AbstractMap" "java.util.Map"))
+(jch-register-supers! "java.util.IdentityHashMap" '("java.util.AbstractMap" "java.util.Map" "java.io.Serializable" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.concurrent.ConcurrentHashMap"
+                      '("java.util.AbstractMap" "java.util.concurrent.ConcurrentMap" "java.io.Serializable"))
+(jch-register-supers! "java.util.LinkedHashMap" '("java.util.HashMap" "java.util.SequencedMap"))
+;; Properties is a Hashtable, which is a Map — System/getProperties answers
+;; (instance? java.util.Map …) as well as (instance? java.util.Properties …).
+(jch-register-supers! "java.util.Hashtable" '("java.util.Map"))
+(jch-register-supers! "java.util.Properties" '("java.util.Hashtable"))
+(jch-register-supers! "java.util.HashSet" '("java.util.Set"))
+(jch-register-supers! "java.util.LinkedHashSet" '("java.util.HashSet" "java.util.SequencedSet"))
+;; the LinkedHashMap / LinkedHashSet views and entries (linked-hash.ss)
+(jch-register-supers! "java.util.LinkedHashMap$ReversedLinkedHashMapView" '("java.util.AbstractMap" "java.util.SequencedMap"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedKeySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedValues" '("java.util.AbstractCollection" "java.util.SequencedCollection"))
+(jch-register-supers! "java.util.LinkedHashMap$LinkedEntrySet" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.LinkedHashMap$Entry" '("java.util.Map$Entry"))
+(jch-register-supers! "jdk.internal.util.NullableKeyValueHolder" '("java.util.Map$Entry"))
+(jch-register-supers! "java.util.LinkedHashSet$1ReverseLinkedHashSetView" '("java.util.AbstractSet" "java.util.SequencedSet"))
+(for-each (lambda (c) (jch-register-supers! c '("java.util.Iterator")))
+          '("java.util.LinkedHashMap$LinkedKeyIterator" "java.util.LinkedHashMap$LinkedValueIterator"
+            "java.util.LinkedHashMap$LinkedEntryIterator" "java.util.HashMap$KeyIterator"
+            "java.util.RegularEnumSet$EnumSetIterator" "java.util.JumboEnumSet$EnumSetIterator"
+            "java.util.EnumMap$KeyIterator" "java.util.EnumMap$ValueIterator" "java.util.EnumMap$EntryIterator"
+            "java.util.ArrayList$Itr" "java.util.LinkedList$ListItr" "java.util.ArrayDeque$DeqIterator"
+            "java.util.Arrays$ArrayItr" "java.util.ImmutableCollections$ListItr"))
+(jch-register-supers! "java.util.EnumMap$EntryIterator$Entry" '("java.util.Map$Entry"))
+;; java.util.TreeMap / TreeSet and the views they hand out (tree-map.ss), with
+;; the sorted/navigable/sequenced interfaces between them and Map / Set, and
+;; the Comparator objects Comparator/reverseOrder and naturalOrder return.
+;; Direct supers and modifiers probed on JDK 21.
+(jch-register-supers! "java.util.SequencedMap" '("java.util.Map"))
+(jch-register-supers! "java.util.SortedMap" '("java.util.SequencedMap"))
+(jch-register-supers! "java.util.NavigableMap" '("java.util.SortedMap"))
+(jch-register-supers! "java.util.SequencedSet" '("java.util.SequencedCollection" "java.util.Set"))
+(jch-register-supers! "java.util.SortedSet" '("java.util.Set" "java.util.SequencedSet"))
+(jch-register-supers! "java.util.NavigableSet" '("java.util.SortedSet"))
+(for-each jch-mark-interface!
+          '("java.util.SequencedMap" "java.util.SortedMap" "java.util.NavigableMap"
+            "java.util.SequencedSet" "java.util.SortedSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.AbstractMap" '("java.util.Map"))
+(jch-register-supers! "java.util.AbstractCollection" '("java.util.Collection"))
+(jch-register-supers! "java.util.AbstractSet" '("java.util.AbstractCollection" "java.util.Set"))
+(jch-register-supers! "java.util.TreeMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap"
+  '("java.util.AbstractMap" "java.util.NavigableMap" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap" '("java.util.TreeMap$NavigableSubMap"))
+(jch-register-supers! "java.util.TreeMap$KeySet" '("java.util.AbstractSet" "java.util.NavigableSet"))
+(jch-register-supers! "java.util.TreeMap$Values" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.TreeMap$EntrySet" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$PrivateEntryIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$Entry" '("java.util.Map$Entry"))
+;; java.util.Spliterator: an interface with no super-interfaces, which the
+;; sub-map key iterators implement
+(jch-register-supers! "java.util.Spliterator" '())
+(jch-mark-interface! "java.util.Spliterator")
+;; the concrete iterators and a sub-map's entry-set and values views
+(jch-register-supers! "java.util.TreeMap$EntryIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$KeyIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$ValueIterator" '("java.util.TreeMap$PrivateEntryIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapIterator" '("java.util.Iterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"
+  '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.Spliterator"))
+(jch-register-supers! "java.util.TreeMap$NavigableSubMap$EntrySetView" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+  '("java.util.TreeMap$NavigableSubMap$EntrySetView"))
+(jch-register-supers! "java.util.AbstractMap$2" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.AbstractMap$2$1" '("java.util.Iterator"))
+(define jch-treemap-iterator-classes
+  '("java.util.TreeMap$EntryIterator" "java.util.TreeMap$KeyIterator" "java.util.TreeMap$ValueIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator"
+    "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator"
+    "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator"))
+(for-each jch-mark-final! jch-treemap-iterator-classes)
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+            "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"))
+(for-each jch-mark-abstract!
+          '("java.util.TreeMap$NavigableSubMap$SubMapIterator" "java.util.TreeMap$NavigableSubMap$EntrySetView"))
+;; package-private and INNER (no static bit) on JDK 21, modifiers 0 / 16 / 1024
+(for-each (lambda (n) (jch-mark-package-private! n) (jch-mark-inner! n))
+          (append jch-treemap-iterator-classes
+                  '("java.util.TreeMap$PrivateEntryIterator" "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+                    "java.util.TreeMap$NavigableSubMap$SubMapIterator"
+                    "java.util.TreeMap$NavigableSubMap$EntrySetView"
+                    "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView"
+                    "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView"
+                    "java.util.AbstractMap$2" "java.util.AbstractMap$2$1")))
+(jch-register-supers! "java.util.AbstractMap$SimpleImmutableEntry" '("java.util.Map$Entry" "java.io.Serializable"))
+(jch-register-supers! "java.util.TreeSet"
+  '("java.util.AbstractSet" "java.util.NavigableSet" "java.lang.Cloneable" "java.io.Serializable"))
+;; EnumSet / EnumMap (enum-colls.ss): the two concrete EnumSet classes the JDK
+;; picks between by the universe's size, and EnumMap with its three views
+(jch-register-supers! "java.util.EnumSet" '("java.util.AbstractSet" "java.lang.Cloneable" "java.io.Serializable"))
+(jch-register-supers! "java.util.RegularEnumSet" '("java.util.EnumSet"))
+(jch-register-supers! "java.util.JumboEnumSet" '("java.util.EnumSet"))
+(jch-register-supers! "java.util.EnumMap" '("java.util.AbstractMap" "java.io.Serializable" "java.lang.Cloneable"))
+(jch-register-supers! "java.util.EnumMap$KeySet" '("java.util.AbstractSet"))
+(jch-register-supers! "java.util.EnumMap$Values" '("java.util.AbstractCollection"))
+(jch-register-supers! "java.util.EnumMap$EntrySet" '("java.util.AbstractSet"))
+(jch-mark-abstract! "java.util.EnumSet")
+(for-each jch-mark-final! '("java.util.RegularEnumSet" "java.util.JumboEnumSet"))
+(for-each jch-mark-package-private! '("java.util.RegularEnumSet" "java.util.JumboEnumSet"))
+(for-each jch-mark-private! '("java.util.EnumMap$KeySet" "java.util.EnumMap$Values" "java.util.EnumMap$EntrySet"))
+(jch-register-supers! "java.util.Collections$ReverseComparator" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Collections$ReverseComparator2" '("java.util.Comparator" "java.io.Serializable"))
+(jch-register-supers! "java.util.Comparators$NaturalOrderComparator" '("java.lang.Enum" "java.util.Comparator"))
+(jch-register-supers! "clojure.lang.RT$DefaultComparator" '("java.util.Comparator" "java.io.Serializable"))
+(for-each jch-mark-abstract!
+          '("java.util.AbstractMap" "java.util.AbstractCollection" "java.util.AbstractSet"
+            "java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$PrivateEntryIterator"))
+(for-each jch-mark-final!
+          '("java.util.TreeMap$AscendingSubMap" "java.util.TreeMap$DescendingSubMap"
+            "java.util.TreeMap$KeySet" "java.util.Comparators$NaturalOrderComparator"
+            "java.util.TreeMap$Entry"))
+(for-each jch-mark-package-private!
+          '("java.util.TreeMap$NavigableSubMap" "java.util.TreeMap$AscendingSubMap"
+            "java.util.TreeMap$DescendingSubMap" "java.util.TreeMap$KeySet"
+            "java.util.TreeMap$Values" "java.util.TreeMap$EntrySet"
+            "java.util.Comparators$NaturalOrderComparator" "java.util.TreeMap$Entry"
+            "clojure.lang.RT$DefaultComparator"))
+(for-each jch-mark-private!
+          '("java.util.Collections$ReverseComparator" "java.util.Collections$ReverseComparator2"))
+
+;; ---- the rows typed.clojure's annotation corpus names ------------------------
+;; typed.ann.clojure.base's override-classes resolves every class it annotates
+;; through ns-resolve and throws "Could not resolve class" on a miss; its checker
+;; then validates each :replace key against the class's DIRECT bases. Direct
+;; supers here are the JVM's (probed), for both reasons.
+;; java.lang.ref: the abstract Reference over the two reference classes the shim
+;; already backs (host-static-classes.ss), and the queue they enqueue on.
+(jch-register-supers! "java.lang.ref.Reference" '())
+(jch-register-supers! "java.lang.ref.SoftReference" '("java.lang.ref.Reference"))
+(jch-register-supers! "java.lang.ref.WeakReference" '("java.lang.ref.Reference"))
+(jch-register-supers! "java.lang.ref.ReferenceQueue" '())
+;; String.CASE_INSENSITIVE_ORDER's own class: String's private nested comparator
+(jch-register-supers! "java.lang.String$CaseInsensitiveComparator"
+                      '("java.util.Comparator" "java.io.Serializable"))
+;; a defmulti value: MultiFn extends AFn, so it is an IFn and not a Fn
+(jch-register-supers! "clojure.lang.MultiFn" '("clojure.lang.AFn"))
+;; the transient lattice: the interfaces, the two abstract bases, and the four
+;; concrete (package-private) classes the transient class arm reports. They used
+;; to fall to the fn rule below — a $ in an unregistered name — so
+;; (bases (class (transient #{}))) answered clojure.lang.AFunction.
+(jch-register-supers! "clojure.lang.ITransientCollection" '())
+(jch-register-supers! "clojure.lang.ITransientAssociative" '("clojure.lang.ITransientCollection" "clojure.lang.ILookup"))
+(jch-register-supers! "clojure.lang.ITransientAssociative2" '("clojure.lang.ITransientAssociative"))
+(jch-register-supers! "clojure.lang.ITransientMap" '("clojure.lang.ITransientAssociative" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.ITransientVector" '("clojure.lang.ITransientAssociative" "clojure.lang.Indexed"))
+(jch-register-supers! "clojure.lang.ITransientSet" '("clojure.lang.ITransientCollection" "clojure.lang.Counted"))
+(jch-register-supers! "clojure.lang.ATransientMap"
+                      '("clojure.lang.AFn" "clojure.lang.ITransientMap" "clojure.lang.ITransientAssociative2"))
+(jch-register-supers! "clojure.lang.ATransientSet" '("clojure.lang.AFn" "clojure.lang.ITransientSet"))
+(jch-register-supers! "clojure.lang.PersistentHashMap$TransientHashMap" '("clojure.lang.ATransientMap"))
+(jch-register-supers! "clojure.lang.PersistentArrayMap$TransientArrayMap" '("clojure.lang.ATransientMap"))
+(jch-register-supers! "clojure.lang.PersistentHashSet$TransientHashSet" '("clojure.lang.ATransientSet"))
+(jch-register-supers! "clojure.lang.PersistentVector$TransientVector"
+                      '("clojure.lang.AFn" "clojure.lang.ITransientVector"
+                        "clojure.lang.ITransientAssociative2" "clojure.lang.Counted"))
+;; --- the java.lang auto-imports ---------------------------------------------
+;; clojure.core maps 96 class names into every namespace, so on the JVM every one
+;; of them resolves, always. 38 had no row here, which meant no class token, which
+;; meant (resolve 'ExceptionInInitializerError) answered nil where the JVM answers
+;; the class (jolt-9my7). A row is what backs the name: it mints the clojure.core
+;; token (class-token-alist, host-class.ss) so the bare symbol evaluates to the
+;; class, which is the half resolve's answer promises — the instance? macro reads
+;; a class from resolve as "this symbol evaluates to that class" and emits it
+;; unquoted.
+;;
+;; A row is the class's NAME and ancestry, not an implementation: (StringBuffer.
+;; "a") still has no constructor here, exactly as before. That is safe in a way it
+;; would not be for an arbitrary class — resolve is how tooling feature-DETECTS a
+;; class, and these 96 are present on every JVM, so no program can be using one as
+;; a capability test.
+;;
+;; Direct supers are the JVM's wherever jolt models the parent. Where it does not
+;; — StringBuffer's package-private AbstractStringBuilder, Package's NamedPackage,
+;; RuntimePermission's java.security.BasicPermission — the row roots at Object and
+;; keeps the interfaces jolt does model, so .getSuperclass is the one thing that
+;; differs. Process's java.io.Closeable is left off deliberately: it is JDK-version
+;; dependent, and claiming it would let with-open take a Process.
+(jch-register-supers! "java.lang.ArrayStoreException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.EnumConstantNotPresentException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IllegalMonitorStateException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.NegativeArraySizeException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.SecurityException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.TypeNotPresentException" '("java.lang.RuntimeException"))
+(jch-register-supers! "java.lang.IllegalThreadStateException" '("java.lang.IllegalArgumentException"))
+(jch-register-supers! "java.lang.InstantiationException" '("java.lang.ReflectiveOperationException"))
+(jch-register-supers! "java.lang.ClassFormatError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.ExceptionInInitializerError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.VerifyError" '("java.lang.LinkageError"))
+(jch-register-supers! "java.lang.UnsupportedClassVersionError" '("java.lang.ClassFormatError"))
+(jch-register-supers! "java.lang.InstantiationError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.NoSuchFieldError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.NoSuchMethodError" '("java.lang.IncompatibleClassChangeError"))
+(jch-register-supers! "java.lang.UnknownError" '("java.lang.VirtualMachineError"))
+(jch-register-supers! "java.lang.ClassLoader" '())
+;; every enum's superclass (java/enums.ss registers each enum under it)
+(jch-register-supers! "java.lang.Enum" '("java.lang.constant.Constable" "java.lang.Comparable" "java.io.Serializable"))
+(jch-mark-abstract! "java.lang.Enum")
+(jch-register-supers! "java.lang.constant.Constable" '())
+(jch-mark-interface! "java.lang.constant.Constable")
+(jch-register-supers! "java.lang.Package" '())
+(jch-register-supers! "java.lang.Process" '())
+;; the handle shim's class had the same gap the redirect's did below — a tag row
+;; and no graph row — so it was not a known class, and the statics process.ss
+;; now registers had nothing to hang an (instance? ProcessHandle …) off
+(jch-register-supers! "java.lang.ProcessHandle" '())
+(jch-register-supers! "java.lang.ProcessBuilder" '())
+;; the redirect shim's class had a tag row but no graph row, so it was not a
+;; known class: no token, no nested-static modifier bit
+(jch-register-supers! "java.lang.ProcessBuilder$Redirect" '())
+(jch-register-supers! "java.lang.ProcessBuilder$Redirect$Type" '("java.lang.Enum"))
+(jch-register-supers! "java.lang.Runtime" '())
+(jch-register-supers! "java.lang.RuntimePermission" '())
+(jch-register-supers! "java.lang.SecurityManager" '())
+(jch-register-supers! "java.lang.StackTraceElement" '())
+(jch-register-supers! "java.lang.StrictMath" '())
+(jch-register-supers! "java.lang.StringBuffer" '("java.lang.CharSequence" "java.lang.Appendable" "java.lang.Comparable"))
+(jch-register-supers! "java.lang.ThreadLocal" '())
+(jch-register-supers! "java.lang.InheritableThreadLocal" '("java.lang.ThreadLocal"))
+(jch-register-supers! "java.lang.ThreadGroup" '("java.lang.Thread$UncaughtExceptionHandler"))
+(jch-register-supers! "java.lang.Thread$State" '("java.lang.Enum"))
+(jch-register-supers! "java.lang.Void" '())
+(jch-register-supers! "clojure.lang.Compiler" '())
+;; interfaces, including the three annotations — an annotation type IS an
+;; interface on the JVM, and extends java.lang.annotation.Annotation.
+(jch-register-supers! "java.lang.Cloneable" '())
+(jch-mark-interface! "java.lang.Cloneable")
+(jch-register-supers! "java.lang.Thread$UncaughtExceptionHandler" '())
+(jch-mark-interface! "java.lang.Thread$UncaughtExceptionHandler")
+(jch-register-supers! "java.lang.annotation.Annotation" '())
+(jch-mark-interface! "java.lang.annotation.Annotation")
+(jch-register-supers! "java.lang.Deprecated" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.Deprecated")
+(jch-register-supers! "java.lang.Override" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.Override")
+(jch-register-supers! "java.lang.SuppressWarnings" '("java.lang.annotation.Annotation"))
+(jch-mark-interface! "java.lang.SuppressWarnings")
+
+;; base interfaces used as super targets — need keys for simple-name resolution
+(jch-register-supers! "java.lang.Number" '("java.io.Serializable"))
+(jch-register-supers! "java.lang.Iterable" '())
+(jch-register-supers! "java.util.Map" '())
+(jch-register-supers! "java.lang.CharSequence" '())
+(jch-register-supers! "java.lang.Comparable" '())
+(jch-register-supers! "java.lang.Runnable" '())
+(jch-register-supers! "java.util.concurrent.Callable" '())
+;; java.util.concurrent's executor/future interfaces. The shims for these
+;; (concurrency.ss) had no rows at all, so an ExecutorService reported (class x)
+;; => :object and answered FALSE to (instance? java.util.concurrent.Executor x) —
+;; which is the seam core.async.flow tests a user-supplied :io-exec through, so a
+;; real jolt executor was rejected as "not an Executor". The graph is consulted
+;; only by instance?/class (host-static-classes.ss), so naming it costs a shim
+;; value nothing to construct or call.
+(jch-register-supers! "java.util.concurrent.Executor" '())
+(jch-mark-interface! "java.util.concurrent.Executor")
+;; AutoCloseable since JDK 19 (close() waits for the tasks).
+(jch-register-supers! "java.util.concurrent.ExecutorService"
+                      '("java.util.concurrent.Executor" "java.lang.AutoCloseable"))
+(jch-mark-interface! "java.util.concurrent.ExecutorService")
+(jch-register-supers! "java.util.concurrent.AbstractExecutorService"
+                      '("java.util.concurrent.ExecutorService" "java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.ThreadPoolExecutor"
+                      '("java.util.concurrent.AbstractExecutorService"
+                        "java.util.concurrent.ExecutorService" "java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.Future" '())
+(jch-mark-interface! "java.util.concurrent.Future")
+(jch-register-supers! "java.util.concurrent.RunnableFuture"
+                      '("java.util.concurrent.Future" "java.lang.Runnable"))
+(jch-mark-interface! "java.util.concurrent.RunnableFuture")
+;; FutureTask is the class Executors' pools hand back from submit, and the one
+;; core.async.flow's futurize constructs directly.
+(jch-register-supers! "java.util.concurrent.FutureTask"
+                      '("java.util.concurrent.RunnableFuture"
+                        "java.util.concurrent.Future" "java.lang.Runnable"))
+;; The scheduled half (concurrency.ss, jolt-hgjo): the two scheduled factories
+;; and the ScheduledThreadPoolExecutor ctor answer a pool that is a
+;; ThreadPoolExecutor AND a ScheduledExecutorService, and what its schedule
+;; methods hand back is the JVM's own nested ScheduledFutureTask — a FutureTask
+;; that is also a Delayed (so Comparable) ScheduledFuture.
+(jch-register-supers! "java.util.concurrent.ScheduledExecutorService"
+                      '("java.util.concurrent.ExecutorService"))
+(jch-mark-interface! "java.util.concurrent.ScheduledExecutorService")
+(jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor"
+                      '("java.util.concurrent.ThreadPoolExecutor"
+                        "java.util.concurrent.ScheduledExecutorService"))
+(jch-register-supers! "java.util.concurrent.Delayed" '("java.lang.Comparable"))
+(jch-mark-interface! "java.util.concurrent.Delayed")
+(jch-register-supers! "java.util.concurrent.ScheduledFuture"
+                      '("java.util.concurrent.Delayed" "java.util.concurrent.Future"))
+(jch-mark-interface! "java.util.concurrent.ScheduledFuture")
+(jch-register-supers! "java.util.concurrent.RunnableScheduledFuture"
+                      '("java.util.concurrent.RunnableFuture" "java.util.concurrent.ScheduledFuture"))
+(jch-mark-interface! "java.util.concurrent.RunnableScheduledFuture")
+(jch-register-supers! "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask"
+                      '("java.util.concurrent.FutureTask"
+                        "java.util.concurrent.RunnableScheduledFuture"))
+;; newVirtualThreadPerTaskExecutor's class: package-private, an ExecutorService
+;; (so AutoCloseable) but neither a ThreadPoolExecutor nor an AbstractExecutorService.
+(jch-register-supers! "java.util.concurrent.ThreadPerTaskExecutor"
+                      '("java.util.concurrent.ExecutorService"))
+;; CompletableFuture (concurrency.ss): a Future and a CompletionStage, and the
+;; enum its state() answers. delayedExecutor's Executor is a nested class.
+(jch-register-supers! "java.util.concurrent.CompletionStage" '())
+(jch-mark-interface! "java.util.concurrent.CompletionStage")
+(jch-register-supers! "java.util.concurrent.CompletableFuture"
+                      '("java.util.concurrent.Future" "java.util.concurrent.CompletionStage"))
+(jch-register-supers! "java.util.concurrent.CompletableFuture$DelayedExecutor"
+                      '("java.util.concurrent.Executor"))
+(jch-register-supers! "java.util.concurrent.Future$State" '("java.lang.Enum"))
+;; ManagementFactory/getThreadMXBean (concurrency.ss): the JDK's own class for it.
+(jch-register-supers! "java.lang.management.ManagementFactory" '())
+(jch-register-supers! "java.lang.management.ThreadMXBean" '())
+(jch-mark-interface! "java.lang.management.ThreadMXBean")
+(jch-register-supers! "com.sun.management.internal.HotSpotThreadImpl" '("java.lang.management.ThreadMXBean"))
+;; locks, latches and the four atomics. Every one of these had a shim with
+;; methods and NO class row, so (class x) answered the :object placeholder and
+;; (instance? java.util.concurrent.locks.Lock a-reentrant-lock) was false.
+(jch-register-supers! "java.util.concurrent.locks.Lock" '())
+(jch-mark-interface! "java.util.concurrent.locks.Lock")
+(jch-register-supers! "java.util.concurrent.locks.ReentrantLock"
+                      '("java.util.concurrent.locks.Lock" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.CountDownLatch" '())
+(jch-register-supers! "java.util.Timer" '())
+;; sun.misc.Signal (concurrency.ss). SignalHandler is outside java.*, so the
+;; generated interface table does not have it.
+(jch-register-supers! "sun.misc.Signal" '())
+(jch-register-supers! "sun.misc.SignalHandler" '())
+(jch-mark-interface! "sun.misc.SignalHandler")
+(jch-register-supers! "sun.misc.Signal$SunMiscHandler" '("sun.misc.SignalHandler"))
+(jch-register-supers! "java.util.TimerTask" '("java.lang.Runnable"))
+(jch-mark-abstract! "java.util.TimerTask")
+;; AtomicInteger and AtomicLong extend Number on the JVM; AtomicBoolean and
+;; AtomicReference extend Object. (instance? Number an-atomic) has to tell them
+;; apart, which is why the four carry four tags.
+(jch-register-supers! "java.util.concurrent.atomic.AtomicInteger"
+                      '("java.lang.Number" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.atomic.AtomicLong"
+                      '("java.lang.Number" "java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.atomic.AtomicBoolean" '("java.io.Serializable"))
+(jch-register-supers! "java.util.concurrent.atomic.AtomicReference" '("java.io.Serializable"))
+;; java.time temporal interfaces — base abstractions the concrete time classes implement
+(jch-register-supers! "java.time.temporal.TemporalAccessor" '())
+(jch-mark-interface! "java.time.temporal.TemporalAccessor")
+(jch-register-supers! "java.time.temporal.Temporal" '("java.time.temporal.TemporalAccessor"))
+(jch-mark-interface! "java.time.temporal.Temporal")
+(jch-register-supers! "java.time.temporal.TemporalAdjuster" '())
+(jch-mark-interface! "java.time.temporal.TemporalAdjuster")
+(jch-register-supers! "java.time.temporal.TemporalAmount" '())
+(jch-mark-interface! "java.time.temporal.TemporalAmount")
+;; java.time.chrono super-interfaces the concrete date/time classes implement
+(jch-register-supers! "java.time.chrono.ChronoLocalDate" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable"))
+(jch-mark-interface! "java.time.chrono.ChronoLocalDate")
+(jch-register-supers! "java.time.chrono.ChronoLocalDateTime" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable"))
+(jch-mark-interface! "java.time.chrono.ChronoLocalDateTime")
+(jch-register-supers! "java.time.chrono.ChronoZonedDateTime" '("java.time.temporal.Temporal" "java.lang.Comparable"))
+(jch-mark-interface! "java.time.chrono.ChronoZonedDateTime")
+;; java.time concrete classes with their real JVM interfaces (all are Serializable)
+(jch-register-supers! "java.time.Instant" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.LocalDate" '("java.time.chrono.ChronoLocalDate" "java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.LocalTime" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.LocalDateTime" '("java.time.chrono.ChronoLocalDateTime" "java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.ZonedDateTime" '("java.time.chrono.ChronoZonedDateTime" "java.time.temporal.Temporal" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.OffsetDateTime" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.OffsetTime" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.Duration" '("java.time.temporal.TemporalAmount" "java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.time.Period" '("java.time.temporal.TemporalAmount" "java.io.Serializable"))
+(jch-register-supers! "java.time.Year" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable"))
+(jch-register-supers! "java.time.YearMonth" '("java.time.temporal.Temporal" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable"))
+(jch-register-supers! "java.time.ZoneId" '())
+(jch-register-supers! "java.time.ZoneOffset" '("java.time.ZoneId" "java.time.temporal.TemporalAccessor" "java.time.temporal.TemporalAdjuster" "java.lang.Comparable"))
+(jch-register-supers! "java.time.zone.ZoneRules" '())
+(jch-register-supers! "java.time.temporal.ChronoUnit" '())
+(jch-register-supers! "java.time.temporal.ChronoField" '())
+(jch-register-supers! "java.time.Month" '("java.time.temporal.TemporalAccessor" "java.time.temporal.TemporalAdjuster"))
+(jch-register-supers! "java.time.DayOfWeek" '("java.time.temporal.TemporalAccessor" "java.time.temporal.TemporalAdjuster"))
+(jch-register-supers! "java.time.Clock" '())
+(jch-register-supers! "java.time.format.DateTimeFormatter" '())
+;; text / util classes with host shims
+(jch-register-supers! "java.text.SimpleDateFormat" '())
+;; java.util.Random and its SecureRandom subclass, StringTokenizer's Enumeration,
+;; Optional, Base64's two nested helpers, Runtime, and the NumberFormat family —
+;; all shims that reported the :object placeholder for want of a row.
+(jch-register-supers! "java.util.random.RandomGenerator" '())
+(jch-mark-interface! "java.util.random.RandomGenerator")
+(jch-register-supers! "java.util.Random"
+                      '("java.util.random.RandomGenerator" "java.io.Serializable"))
+(jch-register-supers! "java.security.SecureRandom" '("java.util.Random"))
+(jch-register-supers! "java.util.SplittableRandom" '("java.util.random.RandomGenerator"))
+(jch-register-supers! "java.util.Enumeration" '())
+(jch-mark-interface! "java.util.Enumeration")
+(jch-register-supers! "java.util.StringTokenizer" '("java.util.Enumeration"))
+(jch-register-supers! "java.util.Collections$3" '("java.util.Enumeration"))
+(jch-register-supers! "java.util.Optional" '())
+;; java.util.stream: each pipeline head is its stream interface, and every
+;; stream a BaseStream, which is AutoCloseable.
+(for-each (lambda (n) (jch-register-supers! n '()) (jch-mark-interface! n))
+          '("java.util.stream.Collector"))
+(jch-register-supers! "java.util.stream.BaseStream" '("java.lang.AutoCloseable"))
+(jch-mark-interface! "java.util.stream.BaseStream")
+(for-each (lambda (n)
+            (jch-register-supers! n '("java.util.stream.BaseStream"))
+            (jch-mark-interface! n))
+          '("java.util.stream.Stream" "java.util.stream.IntStream"
+            "java.util.stream.LongStream" "java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.ReferencePipeline$Head" '("java.util.stream.Stream"))
+(jch-register-supers! "java.util.stream.IntPipeline$Head" '("java.util.stream.IntStream"))
+(jch-register-supers! "java.util.stream.LongPipeline$Head" '("java.util.stream.LongStream"))
+(jch-register-supers! "java.util.stream.DoublePipeline$Head" '("java.util.stream.DoubleStream"))
+(jch-register-supers! "java.util.stream.Collectors$CollectorImpl" '("java.util.stream.Collector"))
+(jch-register-supers! "java.util.ImmutableCollections$ListN" '("java.util.List" "java.util.RandomAccess"))
+(jch-register-supers! "java.util.IntSummaryStatistics" '("java.util.function.IntConsumer"))
+(jch-register-supers! "java.util.LongSummaryStatistics" '("java.util.function.LongConsumer" "java.util.function.IntConsumer"))
+(jch-register-supers! "java.util.DoubleSummaryStatistics" '("java.util.function.DoubleConsumer"))
+(jch-register-supers! "java.util.stream.SpinedBuffer" '("java.util.function.Consumer"))
+(jch-register-supers! "java.util.Base64" '())
+(jch-register-supers! "java.util.Base64$Encoder" '())
+(jch-register-supers! "java.util.Base64$Decoder" '())
+(jch-register-supers! "java.lang.Runtime" '())
+(jch-register-supers! "java.text.Format" '("java.io.Serializable" "java.lang.Cloneable"))
+(jch-register-supers! "java.text.NumberFormat" '("java.text.Format"))
+(jch-register-supers! "java.text.DecimalFormat" '("java.text.NumberFormat"))
+(jch-register-supers! "java.text.Normalizer" '())
+;; The JDK enums the shims model. Each is declared through java/enums.ss, which
+;; gives it the enum surface; the rows are here because the class graph is read
+;; at boot before the shims load (the auto-import table, class tokens).
+(for-each (lambda (c) (jch-register-supers! c '("java.lang.Enum")))
+          '("java.text.Normalizer$Form" "java.util.concurrent.TimeUnit" "java.math.RoundingMode"
+            "java.nio.file.FileVisitResult" "java.nio.file.FileVisitOption"
+            "java.nio.file.attribute.PosixFilePermission"))
+(jch-register-supers! "java.util.GregorianCalendar" '())
+(jch-register-supers! "java.util.Locale" '())
+(jch-register-supers! "java.util.TimeZone" '())
+;; #inst / (Date.) classes. java.sql.Date and java.sql.Timestamp are Date
+;; subclasses: the sql-date shim and the jts child of the #inst record report
+;; them, and their dispatch tags walk up to java.util.Date from here.
+(jch-register-supers! "java.util.Date" '("java.lang.Comparable" "java.io.Serializable"))
+(jch-register-supers! "java.sql.Date" '("java.util.Date"))
+(jch-register-supers! "java.sql.Timestamp" '("java.util.Date"))
+(jch-register-supers! "java.nio.ByteBuffer" '("java.nio.Buffer" "java.lang.Comparable"))
+;; java.nio.file (nio-file.ss). The JVM's concrete classes here are private
+;; implementation details (sun.nio.fs.UnixPath, sun.nio.fs.MacOSXFileSystem), so
+;; the shims report the public interface a caller can actually name, the way the
+;; java.io shims report java.io.Reader rather than a subclass.
+(jch-register-supers! "java.nio.file.Path" '("java.lang.Comparable" "java.lang.Iterable" "java.nio.file.Watchable"))
+(jch-register-supers! "java.nio.file.Watchable" '())
+(jch-register-supers! "java.nio.file.DirectoryStream" '("java.io.Closeable" "java.lang.Iterable"))
+(jch-register-supers! "java.nio.file.FileSystem" '())
+(jch-register-supers! "java.nio.file.PathMatcher" '())
+;; the option interfaces, and the option enums that implement them (declared
+;; through java/enums.ss)
+(jch-register-supers! "java.nio.file.OpenOption" '())
+(jch-register-supers! "java.nio.file.CopyOption" '())
+(for-each jch-mark-interface! '("java.nio.file.OpenOption" "java.nio.file.CopyOption"))
+(jch-register-supers! "java.nio.file.StandardOpenOption" '("java.lang.Enum" "java.nio.file.OpenOption"))
+(jch-register-supers! "java.nio.file.StandardCopyOption" '("java.lang.Enum" "java.nio.file.CopyOption"))
+(jch-register-supers! "java.nio.file.LinkOption" '("java.lang.Enum" "java.nio.file.OpenOption" "java.nio.file.CopyOption"))
+
+;; ---- jhost value tag -> FQN (single value-discriminator registry) --------------
+;; A value-layer shim value (make-jhost tag …) reports its JVM class by this map;
+;; value-host-tags (records.ss) and (class x)/instance? (host-static-classes.ss)
+;; both derive from it, so a shim value's protocol-dispatch tags, class name, and
+;; instance? answers stay in agreement and inherit the graph's supers (an Instant
+;; is a Temporal, a StringWriter is a Writer). Add a row here, not in three places.
+(define jhost-tag->fqn (make-hashtable string-hash string=?))
+(for-each (lambda (p) (hashtable-set! jhost-tag->fqn (car p) (cdr p)))
+  '(("user-thread" . "java.lang.Thread")
+    ("vthread-builder" . "java.lang.ThreadBuilders$VirtualThreadBuilder")
+    ("vthread-factory" . "java.lang.ThreadBuilders$VirtualThreadFactory")
+    ("abq" . "java.util.concurrent.ArrayBlockingQueue")
+    ("lbq" . "java.util.concurrent.LinkedBlockingQueue")
+    ("future-task" . "java.util.concurrent.FutureTask")
+    ;; Executors' pools are ThreadPoolExecutors on the JVM too, and what their
+    ;; submit returns is a FutureTask — the same class the "future-task" tag
+    ;; models, which is why two tags share one FQN here (as the writer tags do).
+    ("executor-service" . "java.util.concurrent.ThreadPoolExecutor")
+    ("vthread-executor" . "java.util.concurrent.ThreadPerTaskExecutor")
+    ("j-future" . "java.util.concurrent.FutureTask")
+    ("scheduled-executor" . "java.util.concurrent.ScheduledThreadPoolExecutor")
+    ("scheduled-future" . "java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask")
+    ("completable-future" . "java.util.concurrent.CompletableFuture")
+    ("thread-group" . "java.lang.ThreadGroup")
+    ("thread-mx-bean" . "com.sun.management.internal.HotSpotThreadImpl")
+    ("thread-state" . "java.lang.Thread$State")
+    ("cf-delayed-executor" . "java.util.concurrent.CompletableFuture$DelayedExecutor")
+    ("future-state" . "java.util.concurrent.Future$State")
+    ("instant" . "java.time.Instant")
+    ("local-date" . "java.time.LocalDate")
+    ("local-time" . "java.time.LocalTime")
+    ("local-date-time" . "java.time.LocalDateTime")
+    ("zoned-dt" . "java.time.ZonedDateTime")
+    ("zoned-date-time" . "java.time.ZonedDateTime")
+    ("offset-date-time" . "java.time.OffsetDateTime")
+    ("offset-time" . "java.time.OffsetTime")
+    ("duration" . "java.time.Duration")
+    ("period" . "java.time.Period")
+    ("year" . "java.time.Year")
+    ("year-month" . "java.time.YearMonth")
+    ("zone-id" . "java.time.ZoneId")
+    ("zone-offset" . "java.time.ZoneOffset")
+    ("zone-rules" . "java.time.zone.ZoneRules")
+    ("chrono-unit" . "java.time.temporal.ChronoUnit")
+    ("chrono-field" . "java.time.temporal.ChronoField")
+    ("month-enum" . "java.time.Month")
+    ("dow-enum" . "java.time.DayOfWeek")
+    ("clock" . "java.time.Clock")
+    ("dt-formatter" . "java.time.format.DateTimeFormatter")
+    ("sdf" . "java.text.SimpleDateFormat")
+    ("calendar" . "java.util.GregorianCalendar")
+    ("locale" . "java.util.Locale")
+    ("timezone" . "java.util.TimeZone")
+    ("sql-date" . "java.sql.Date")
+    ("uri" . "java.net.URI")
+    ;; java.nio.file shims (nio-file.ss)
+    ("nio-path" . "java.nio.file.Path")
+    ("nio-filesystem" . "java.nio.file.FileSystem")
+    ("nio-path-matcher" . "java.nio.file.PathMatcher")
+    ("byte-buffer" . "java.nio.ByteBuffer")
+    ;; java.nio's buffers and ByteOrder (byte-buffer.ss)
+    ("nio-char-buffer" . "java.nio.CharBuffer")
+    ("short-buffer" . "java.nio.ShortBuffer")
+    ("int-buffer" . "java.nio.IntBuffer")
+    ("long-buffer" . "java.nio.LongBuffer")
+    ("float-buffer" . "java.nio.FloatBuffer")
+    ("double-buffer" . "java.nio.DoubleBuffer")
+    ("byte-order" . "java.nio.ByteOrder")
+    ("coder-result" . "java.nio.charset.CoderResult")
+    ("coding-error-action" . "java.nio.charset.CodingErrorAction")
+    ("arraylist" . "java.util.ArrayList")
+    ("arrays-aslist" . "java.util.Arrays$ArrayList")
+    ("linkedlist" . "java.util.LinkedList")
+    ("arraydeque" . "java.util.ArrayDeque")
+    ("hashmap" . "java.util.HashMap")
+    ("chm" . "java.util.concurrent.ConcurrentHashMap")
+    ("jx-weak-hashmap" . "java.util.WeakHashMap")
+    ("jx-identity-hashmap" . "java.util.IdentityHashMap")
+    ("linkedhashmap" . "java.util.LinkedHashMap")
+    ("properties" . "java.util.Properties")
+    ("hashset" . "java.util.HashSet")
+    ("linkedhashset" . "java.util.LinkedHashSet")
+    ("hashset-iterator" . "java.util.HashMap$KeyIterator")
+    ;; tree-map.ss: a TreeMap, its views, a TreeSet, and the Comparator objects
+    ("treemap" . "java.util.TreeMap")
+    ("treemap-asc-sub" . "java.util.TreeMap$AscendingSubMap")
+    ("treemap-desc-sub" . "java.util.TreeMap$DescendingSubMap")
+    ("treemap-keyset" . "java.util.TreeMap$KeySet")
+    ("treemap-values" . "java.util.TreeMap$Values")
+    ("treemap-entryset" . "java.util.TreeMap$EntrySet")
+    ("treeset" . "java.util.TreeSet")
+    ("treemap-entry" . "java.util.TreeMap$Entry")
+    ("immutable-entry" . "java.util.AbstractMap$SimpleImmutableEntry")
+    ;; a sub-map's entrySet() and values(), and the iterators: one tag per JDK class
+    ("treemap-asc-entryset" . "java.util.TreeMap$AscendingSubMap$AscendingEntrySetView")
+    ("treemap-desc-entryset" . "java.util.TreeMap$DescendingSubMap$DescendingEntrySetView")
+    ("treemap-submap-values" . "java.util.AbstractMap$2")
+    ("treemap-entry-iterator" . "java.util.TreeMap$EntryIterator")
+    ("treemap-key-iterator" . "java.util.TreeMap$KeyIterator")
+    ("treemap-value-iterator" . "java.util.TreeMap$ValueIterator")
+    ("treemap-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapEntryIterator")
+    ("treemap-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$SubMapKeyIterator")
+    ("treemap-desc-submap-entry-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapEntryIterator")
+    ("treemap-desc-submap-key-iterator" . "java.util.TreeMap$NavigableSubMap$DescendingSubMapKeyIterator")
+    ("treemap-submap-value-iterator" . "java.util.AbstractMap$2$1")
+    ("reverse-comparator" . "java.util.Collections$ReverseComparator")
+    ("reverse-comparator2" . "java.util.Collections$ReverseComparator2")
+    ("natural-comparator" . "java.util.Comparators$NaturalOrderComparator")
+    ("rt-default-comparator" . "clojure.lang.RT$DefaultComparator")
+    ;; io writer/reader shims: *out* is a PrintWriter like the JVM REPL's
+    ("port-writer" . "java.io.PrintWriter")
+    ("print-writer" . "java.io.PrintWriter")
+    ;; …and System/out is a PrintStream, which is a different class from a
+    ;; different branch of the taxonomy. The shim (io-streams.ss) had no row here,
+    ;; so every PrintStream reported (class x) => :object and answered false to
+    ;; (instance? java.io.OutputStream x).
+    ("print-stream" . "java.io.PrintStream")
+    ("writer" . "java.io.StringWriter")
+    ("string-reader" . "java.io.StringReader")
+    ("pushback-reader" . "java.io.PushbackReader")
+    ;; the line-numbering subclass carries its own tag so a value reports the
+    ;; class it really is — tools.reader does (extend LineNumberingPushbackReader
+    ;; IndexingReader …), which only fires when get-line-number's dispatch sees
+    ;; that class and not the plain PushbackReader one.
+    ("line-numbering-pushback-reader" . "clojure.lang.LineNumberingPushbackReader")
+    ("char-writer" . "java.io.OutputStreamWriter")
+    ("char-reader" . "java.io.InputStreamReader")
+    ("console" . "java.io.Console")
+    ;; the delegating wrapper over a Reader jolt did not build (io-streams.ss)
+    ("reader-adapter" . "java.io.BufferedReader")
+    ("time-unit" . "java.util.concurrent.TimeUnit")
+    ;; Files/getLastModifiedTime and fs/last-modified-time (nio-file.ss)
+    ("file-time" . "java.nio.file.attribute.FileTime")
+    ("normalizer-form" . "java.text.Normalizer$Form")
+    ;; subprocess shims (process.ss), backing vendored babashka.process
+    ("process-builder" . "java.lang.ProcessBuilder")
+    ("process" . "java.lang.Process")
+    ("process-redirect" . "java.lang.ProcessBuilder$Redirect")
+    ("process-handle" . "java.lang.ProcessHandle")
+    ;; java.lang.reflect member objects (java/natives-array.ss,
+    ;; java/host-static-classes.ss). Two field tags share one FQN: a deftype's
+    ;; declared field and a registered host static are both a java.lang.reflect.Field
+    ;; to a caller, and differ only in where the value comes from.
+    ("reflect-method" . "java.lang.reflect.Method")
+    ("reflect-field" . "java.lang.reflect.Field")
+    ("static-field" . "java.lang.reflect.Field")
+    ("class-ctor" . "java.lang.reflect.Constructor")
+    ;; java.lang.ref (host-static-classes.ss): the two reference classes carry
+    ;; their own tags — one shared tag reported a WeakReference as a
+    ;; SoftReference — and the queue both enqueue on. Before these rows every
+    ;; one reported (class x) => :object.
+    ("soft-ref" . "java.lang.ref.SoftReference")
+    ("weak-ref" . "java.lang.ref.WeakReference")
+    ("ref-queue" . "java.lang.ref.ReferenceQueue")
+    ;; String.CASE_INSENSITIVE_ORDER (host-static-methods.ss)
+    ("string-ci-comparator" . "java.lang.String$CaseInsensitiveComparator")
+    ;; the two java.lang.ThreadLocal storage shims (host-static-classes.ss). Two
+    ;; tags because the classes are two: a caller asks which one it holds with
+    ;; instance?, and (proxy [InheritableThreadLocal] …) has to lower to the
+    ;; inheriting one. Without these rows both reported (class x) => :object and
+    ;; answered false to (instance? ThreadLocal x).
+    ("threadlocal" . "java.lang.ThreadLocal")
+    ("inheritable-threadlocal" . "java.lang.InheritableThreadLocal")
+    ;; the four atomics (host-static-classes.ss), one tag each so instance? can
+    ;; tell the Number-extending pair from the other two
+    ("atomic-integer" . "java.util.concurrent.atomic.AtomicInteger")
+    ("atomic-long" . "java.util.concurrent.atomic.AtomicLong")
+    ("atomic-boolean" . "java.util.concurrent.atomic.AtomicBoolean")
+    ("atomic-reference" . "java.util.concurrent.atomic.AtomicReference")
+    ("reentrant-lock" . "java.util.concurrent.locks.ReentrantLock")
+    ("count-down-latch" . "java.util.concurrent.CountDownLatch")
+    ("timer" . "java.util.Timer")
+    ("signal" . "sun.misc.Signal")
+    ("signal-native-handler" . "sun.misc.Signal$SunMiscHandler")
+    ("random" . "java.util.Random")
+    ("splittable-random" . "java.util.SplittableRandom")
+    ("securerandom" . "java.security.SecureRandom")
+    ("optional" . "java.util.Optional")
+    ;; java.util.stream (streams.ss): the JDK's pipeline head classes
+    ("stream" . "java.util.stream.ReferencePipeline$Head")
+    ("int-stream" . "java.util.stream.IntPipeline$Head")
+    ("long-stream" . "java.util.stream.LongPipeline$Head")
+    ("double-stream" . "java.util.stream.DoublePipeline$Head")
+    ("stream-collector" . "java.util.stream.Collectors$CollectorImpl")
+    ("immutable-list" . "java.util.ImmutableCollections$ListN")
+    ("int-summary-stats" . "java.util.IntSummaryStatistics")
+    ("long-summary-stats" . "java.util.LongSummaryStatistics")
+    ("double-summary-stats" . "java.util.DoubleSummaryStatistics")
+    ("stream-sink" . "java.util.stream.SpinedBuffer")
+    ("string-tokenizer" . "java.util.StringTokenizer")
+    ;; Collections/enumeration's anonymous class, as the JDK names it
+    ("seq-enumeration" . "java.util.Collections$3")
+    ("b64-encoder" . "java.util.Base64$Encoder")
+    ("b64-decoder" . "java.util.Base64$Decoder")
+    ("jolt-runtime" . "java.lang.Runtime")
+    ;; NumberFormat/getInstance hands back a DecimalFormat on the JVM, and the one
+    ;; numberformat shim is only ever built by those statics (host-static-methods.ss),
+    ;; so it reports the class a caller actually receives.
+    ("numberformat" . "java.text.DecimalFormat")))
+;; FQN for a jhost tag, or #f if the tag names no modeled class (e.g. "class",
+;; "in-stream") — callers fall through on #f.
+(define (jhost-fqn tag) (hashtable-ref jhost-tag->fqn tag #f))
+
+;; The reverse: every tag that models class NAME, or '() for a class no shim
+;; backs. More than one tag can map to one FQN (the two writer tags, the two
+;; field tags), so this answers a LIST — Class.getDeclaredMethods walks it to
+;; report the methods jolt has registered for the class, and dropping the second
+;; tag would silently halve the answer for exactly the classes that have two.
+(define (jhost-tags-for-fqn name)
+  (let-values (((ks vs) (hashtable-entries jhost-tag->fqn)))
+    (let loop ((i 0) (acc '()))
+      (cond ((fx=? i (vector-length ks)) (reverse acc))
+            ((string=? (vector-ref vs i) name) (loop (fx+ i 1) (cons (vector-ref ks i) acc)))
+            (else (loop (fx+ i 1) acc))))))
+
+;; Is this tag one of the pushback readers? Two tags model the pair
+;; (java.io.PushbackReader and its line-numbering subclass), and everything that
+;; asks "is this a pushback reader" must ask HERE rather than compare the tag
+;; literally — a second tag that only some sites recognize is how a reader
+;; silently stops being closeable, slurpable or re-wrappable on one path while
+;; still working on another.
+(define (pushback-reader-tag? t)
+  (or (string=? t "pushback-reader")
+      (string=? t "line-numbering-pushback-reader")))
+
+;; The jhost text sinks: values that take text through their own .write method —
+;; a StringWriter, the process port-writers, a PrintWriter, a
+;; PrintStream. spit, io/copy and with-open's close all ask this, and for the same
+;; reason as above: the set grew a fifth tag when System/out became a PrintStream,
+;; and three hand-copied literal lists is how one of them silently stops accepting
+;; a value the other two do ((io/copy in System/out) -> "unsupported output type").
+(define (text-sink-tag? t)
+  (or (string=? t "writer")
+      (string=? t "port-writer") (string=? t "print-writer")
+      (string=? t "print-stream")))
+;; the protocol-dispatch / instance? tag list for a jhost value's tag, or #f.
+(define (jhost-value-tags tag)
+  (let ((fqn (hashtable-ref jhost-tag->fqn tag #f)))
+    (and fqn (jch-tags fqn))))
+
+;; Public seam: libraries extend the modeled hierarchy.
+(def-var! "jolt.host" "register-class-supers!"
+  (lambda (name supers) (jch-register-supers! name (seq->list supers)) jolt-nil))
+
+;; the ONE superclass edge for Class.getSuperclass: the first direct super that
+;; is not an interface, else java.lang.Object for a known concrete class. #f for
+;; Object itself, for interfaces (the JVM's null), and for names the graph does
+;; not model — the caller decides what unknown means (the reflection surface
+;; answers nil there, a recorded divergence for statics-only shims like Math).
+(define (jch-superclass name)
+  (cond
+    ((string=? name "java.lang.Object") #f)
+    ((jch-interface? name) #f)
+    ((not (jch-known? name)) #f)
+    (else
+     ;; prefer a concrete super over Object wherever it sits in the row —
+     ;; a row may list Object ahead of an abstract base.
+     (let loop ((ss (jch-direct-supers name)))
+       (cond ((null? ss) "java.lang.Object")
+             ((or (jch-interface? (car ss))
+                  (string=? (car ss) "java.lang.Object"))
+              (loop (cdr ss)))
+             (else (car ss)))))))
+
+;; transitive ancestry rooted at Object for a concrete class; an interface's chain
+;; has no Object (its getSuperclass is null). '() for Object itself.
+(define (jch-ancestors-rooted name)
+  (if (or (string=? name "java.lang.Object") (jch-interface? name))
+      (jch-closure name)
+      (let ((as (jch-closure name)))
+        (cond ((member "java.lang.Object" as) as)
+              ((null? as) (if (jch-known? name) '("java.lang.Object") '()))
+              (else (append as '("java.lang.Object")))))))
+
+;; bases — the direct supers of a class from the jch graph. c may be a class-name
+;; string, a jclass object (class token), or a JVM-typed value (number, string, etc.).
+;; nil for an unknown class or a nil arg.
+(define (jolt-bases c)
+  (cond
+    ((jolt-nil? c) jolt-nil)
+    ((string? c)
+     (let ((supers (jch-direct-supers c)))
+       (if (null? supers) jolt-nil (list->cseq supers))))
+    (else
+     ;; For a jclass object (e.g. java.lang.Long after class-token eval), extract
+     ;; the represented class name via jclass-name (defined in host-static-classes.ss,
+     ;; loaded after us — resolved at call time). For other values (number, string,
+     ;; etc.), jolt-class-name gives their JVM class name (java.lang.Long, etc.).
+     ;; A deftype/defrecord TYPE TOKEN is its class, not a function: without this
+     ;; (bases Rec) walked the ctor PROCEDURE's ancestry and answered
+     ;; clojure.lang.AFunction, while (bases (class inst)) gave the record's real
+     ;; interfaces. supers/ancestors already routed through the same question via
+     ;; class-key; this was the one spelling that did not.
+     (let ((name (cond ((and (jhost? c) (string=? (jhost-tag c) "class"))
+                        (vector-ref (jhost-state c) 0))
+                       ((and (procedure? c) (deftype-ctor-tag c)) => values)
+                       (else (jolt-class-name c)))))
+       (let ((supers (jch-direct-supers name)))
+         (if (null? supers) jolt-nil (list->cseq supers)))))))
+;; The Chez host re-defs `bases` over this with Class objects (host-static-classes.ss,
+;; which owns the class-token interner and loads after us); this name-string form
+;; is what the Gambit boot, which excludes that file, keeps.
+(def-var! "clojure.core" "bases" jolt-bases)
