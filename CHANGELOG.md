@@ -3,6 +3,20 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.6.0 — 2026-11-25
+
+### Added
+
+- `flake.nix`: nix builds for the desktop examples — `nix run .#desktop-x11`
+  (or `.#desktop-wayland`, `.#desktop-x11-app`) runs the example on a nix-built
+  jolt plus libkrun 2.0 built from source with the virtio-net backend and its
+  musl-static `krun-init` guest init, joined with nixpkgs libkrunfw; `nix
+  develop` provides the full dev toolchain (jolt, libkrun, ip/dnsmasq/nftables,
+  ssh, xauth, a VNC client).
+- `JOLT_LIBKRUN_INIT` env seam: `start!`/`run-image!` now take the guest-init
+  path from the environment, so a nix-built `krun-init` can be injected (the
+  runner previously hardcoded `/tmp/libkrun/target/release/krun-init`).
+
 ## v1.5.0 — 2026-11-25
 
 ### Added
