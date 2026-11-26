@@ -1,0 +1,3 @@
+*.o
+/linux-abi/kernel
+/pvh/pvh

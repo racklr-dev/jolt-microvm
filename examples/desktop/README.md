@@ -7,9 +7,8 @@ single X11 app on the host display over ssh -X.
 
 - a jolt binary at 0.8.28 or newer
 - libkrun + libkrunfw and a writable /dev/kvm (see the repo README)
-- a VNC client for the desktop examples (for example vncviewer, gvncviewer,
-  remmina, or the browser client of your choice)
-- for x11-app.clj only: a running X server on the host and xauth on the host
+- a VNC client for the desktop examples (vncviewer and remmina both work)
+- a running X server and xauth on the host (for x11-app.clj only)
 
 ## Run
 
@@ -34,12 +33,12 @@ nix run .#desktop-wayland    # Wayland desktop over VNC
 nix run .#desktop-x11-app    # one X11 app over ssh -X
 ```
 
-or `nix develop` for the full dev toolchain (jolt, libkrun, ip/dnsmasq/nftables,
-a VNC client). sudo stays on the host — jolt-microvm uses it for tap/apk seeding —
-and the host needs a writable /dev/kvm.
+or `nix develop` for the full dev toolchain (jolt and libkrun, plus
+ip/dnsmasq/nftables and a VNC client). sudo stays on the host; jolt-microvm
+uses it for tap and apk seeding. The host needs a writable /dev/kvm.
 
 The first run apk-installs the desktop profile into the cached alpine base, so
-it downloads roughly a hundred small packages. Later runs reuse that base.
+it downloads roughly a hundred packages. Later runs reuse that base.
 
 ## Connect
 
