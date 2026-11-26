@@ -16,18 +16,27 @@
 #                       Preamble SERVE/READY lines, then pure bencode; drive it
 #                       with ./nrepl-test.py.
 #
+# Build model (serve mode):
+#   The kernel boot (boot-probe.scm -> ~111MB C -> ~110MB .o) is the stable,
+#   expensive base. It is cached in src/boot.c + src/boot.o and NOT rebuilt
+#   unless src/boot.c is missing (or REBUILD=1). serve.scm is small: it is
+#   recompiled + relinked every run, so editing the nREPL loop costs seconds.
+#   The guest itself boots in ~0s and each eval is sub-millisecond.
+#
 # Usage:
 #   ./stage.sh [path/to/gambit-full-build-tree] [boot] [probe|serve]
 #       no args      -> stage + make (produces jolt-bare.elf)
 #       boot         -> also build booter.c against libkrun and boot the ELF
 #       serve        -> build the nREPL endpoint instead of the probe
+#   REBUILD=1 ./stage.sh serve   -> also recompile the kernel boot base
 #
 # Env:
 #   GSC       path to gsc          (default ~/.local/bin/gsc)
 #   LIBKRUN   libkrun prefix       (default /tmp/libkrun)
 #   JOBS      make parallelism     (default 18)
 #   JOLT_LANG jolt-lang repo       (default ../../../../jolt-lang)
-#   CC/BOOT_CC C compiler          (default clang; the 100MB boot.c needs it)
+#   JOLT_CC    C compiler override  (default clang; forced below because the
+#              ~100MB boot.c needs clang and the shell often exports CC=gcc)
 set -eu
 cd "$(dirname "$0")"
 
@@ -51,16 +60,35 @@ done
 mkdir -p src
 case "$MODE" in
   serve)
-    # boot-probe.scm lives in jolt-lang (its ##include "boot-full.ss" resolves
-    # next to it, so it compiles with cwd = jolt-lang/host/gambit) and supplies
-    # the full-profile boot with a live jolt-compile-eval. serve.scm lives HERE
-    # and is self-contained (no ##include). Linking boot-probe.c serve.c emits
-    # serve_.c — the linkfile named after the LAST module — whose ___LNK_serve__
-    # entry kmain passes to ___setup.
-    ( cd "$JOLT_LANG/host/gambit" && "$GSC" -target C -c boot-probe.scm )
+    # Kernel boot base: cached in src/boot.c. Its ##include "boot-full.ss"
+    # resolves next to boot-probe.scm in jolt-lang, so recompiles happen there.
+    # Recompile only when src/boot.c is missing, REBUILD=1 is set, or the
+    # jolt-lang sources that feed it are newer than the cached boot-probe.c
+    # (e.g. a prelude-shims.ss fix landing after the boot was compiled).
+    NEED_BOOT=
+    [ -f "$HERE/src/boot.c" ] || NEED_BOOT=1
+    [ -z "${REBUILD:-}" ] || NEED_BOOT=1
+    if [ -z "$NEED_BOOT" ] && [ -f "$JOLT_LANG/host/gambit/boot-probe.c" ]; then
+      for src in boot-probe.scm boot-full.ss prelude-shims.ss; do
+        if [ "$JOLT_LANG/host/gambit/$src" -nt "$JOLT_LANG/host/gambit/boot-probe.c" ]; then
+          NEED_BOOT=1
+        fi
+      done
+    fi
+    if [ -n "$NEED_BOOT" ]; then
+      echo "[stage] compiling kernel boot (boot-probe.scm -> ~111MB C)..."
+      ( cd "$JOLT_LANG/host/gambit" && "$GSC" -target C -c boot-probe.scm )
+      cp "$JOLT_LANG/host/gambit/boot-probe.c" "$HERE/src/boot.c"
+    else
+      echo "[stage] kernel boot cached (src/boot.c)"
+    fi
+    # serve.scm (here) is small: always recompile + relink. Linking emits
+    # serve_.c (linkfile named after the LAST module) whose ___LNK_serve__ kmain
+    # passes to ___setup. Link against jolt-lang's boot-probe.c so the module
+    # name stays "boot-probe", not "boot".
+    echo "[stage] compiling serve.scm + linkfile..."
     "$GSC" -target C -c serve.scm
     "$GSC" -link "$JOLT_LANG/host/gambit/boot-probe.c" "$HERE/serve.c"
-    cp "$JOLT_LANG/host/gambit/boot-probe.c" "$HERE/src/boot.c"
     cp serve.c  "$HERE/src/serve.c"
     cp serve_.c "$HERE/src/boot_.c"
     BOOT_LINKER=___LNK_serve__
@@ -78,15 +106,17 @@ esac
 CORE="_kernel _io _num _std _nonstd _eval _repl _thread _system _module _gambit mem c_intf setup os_base os_setup os_thread os_shell os_io os_tty os_files os_time os_dyn actlog"
 mkdir -p include
 for f in $CORE; do
-  cp "$GAMBIT_FULL/lib/$f.c" src/
+  cp -p "$GAMBIT_FULL/lib/$f.c" src/
 done
-cp "$GAMBIT_FULL"/lib/*.h    include/
-cp "$GAMBIT_FULL"/include/*.h include/
+cp -p "$GAMBIT_FULL"/lib/*.h    include/
+cp -p "$GAMBIT_FULL"/include/*.h include/
 
 # --- 3. build the ELF ---------------------------------------------------
 # clang is required for the generated ~100MB boot.c (gcc explodes: 1h+/17GB).
-CC="${CC:-clang}" BOOT_CC="${BOOT_CC:-clang}" \
-  make -j"$JOBS" BOOT_LINKER="$BOOT_LINKER"
+# First serve build compiles the ~110MB kernel object once; later runs only
+# rebuild serve.o/boot_.o and relink.
+echo "[stage] building ELF (first run: ~110MB kernel object, one-time)..."
+make -j"$JOBS" BOOT_LINKER="$BOOT_LINKER" CC="${JOLT_CC:-clang}" BOOT_CC="${JOLT_CC:-clang}"
 
 echo
 echo "built: $PWD/jolt-bare.elf (mode=$MODE)"
