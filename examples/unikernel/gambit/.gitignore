@@ -4,4 +4,6 @@ include/
 *.elf
 kernel-probe.c
 kernel-probe_.c
+serve.c
+serve_.c
 booter
