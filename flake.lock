@@ -1,0 +1,135 @@
+{
+  "nodes": {
+    "jolt": {
+      "inputs": {
+        "makes": "makes",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1795660130,
+        "narHash": "sha256-HelpungawD7ODu6WVrNoj9UklpPyClwXLJrsBx6sKG8=",
+        "ref": "refs/heads/main",
+        "rev": "4e7d7fbe3ca091935e62c1f184cd816d2fec0874",
+        "revCount": 6039,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/jolt-lang/jolt.git"
+      },
+      "original": {
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/jolt-lang/jolt.git"
+      }
+    },
+    "libkrun-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795614071,
+        "narHash": "sha256-ZZ5IsMGi/LU/BH/WxgS5Q9Esc3gt1kyzr/TJM27xmt0=",
+        "owner": "containers",
+        "repo": "libkrun",
+        "rev": "d3dc2a75bac6a0ac8e4047791e5ce5960bf289b6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "containers",
+        "repo": "libkrun",
+        "rev": "d3dc2a75bac6a0ac8e4047791e5ce5960bf289b6",
+        "type": "github"
+      }
+    },
+    "makes": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785480273,
+        "narHash": "sha256-/g8O4PW0v3NNChKyrWw/EqpEAUCKiI9/KFE2EiXoUlA=",
+        "owner": "makeplus",
+        "repo": "makes",
+        "rev": "d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "makeplus",
+        "repo": "makes",
+        "rev": "d14cb578c2f04e6f9d00e01c7c4e416a9baf94e9",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787135253,
+        "narHash": "sha256-RD2kNWCG+Bjo6h+JVjWVNntZs2GtRoeY2xHjts/FNkA=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ffb3c9b700e759be2ef13237c9d8f953b32a1e46",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1795234589,
+        "narHash": "sha256-f/VVvxf5RsQgWVhUtefoca5ktVg0DA2bnkMOcmSnozo=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2786a2a72088ecf32aea5b3ec52099e6a7cff78f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1744536153,
+        "narHash": "sha256-awS2zRgF4uTwrOKwwiJcByDzDOdo3Q1rPZbiHQg/N38=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "18dd725c29603f582cf1900e0d25f9f1063dbf11",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "jolt": "jolt",
+        "libkrun-src": "libkrun-src",
+        "nixpkgs": "nixpkgs_2",
+        "rust-overlay": "rust-overlay"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1795604585,
+        "narHash": "sha256-rsB/BPQf+Q9p7O7WhqtmG64b3F175ly7swafxWS1etM=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "67021b279bfffe654a0201ede805748a255ae5a7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

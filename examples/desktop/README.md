@@ -23,6 +23,21 @@ sudo -u $USER --preserve-env env JOLT_BIN=/path/to/jolt \
 Replace x11.clj with wayland.clj for the Wayland desktop, or x11-app.clj for a
 single X11 app on the host display.
 
+### Run with Nix
+
+The repo flake provides a nix-built jolt and libkrun (2.0 with the virtio-net
+backend) plus the desktop apps:
+
+```sh
+nix run .#desktop-x11        # X11 desktop over VNC
+nix run .#desktop-wayland    # Wayland desktop over VNC
+nix run .#desktop-x11-app    # one X11 app over ssh -X
+```
+
+or `nix develop` for the full dev toolchain (jolt, libkrun, ip/dnsmasq/nftables,
+a VNC client). sudo stays on the host — jolt-microvm uses it for tap/apk seeding —
+and the host needs a writable /dev/kvm.
+
 The first run apk-installs the desktop profile into the cached alpine base, so
 it downloads roughly a hundred small packages. Later runs reuse that base.
 

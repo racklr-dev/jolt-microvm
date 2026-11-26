@@ -214,6 +214,14 @@
   (or (System/getenv "JOLT_BIN")
       (str (System/getProperty "user.home") "/.local/bin/jolt")))
 
+(defn- krun-init-bin
+  "Absolute path of libkrun's static guest init (krun-init). The nix flake
+  points JOLT_LIBKRUN_INIT at its nix-built copy; the default matches a
+  source-tree build under /tmp/libkrun."
+  []
+  (or (System/getenv "JOLT_LIBKRUN_INIT")
+      "/tmp/libkrun/target/release/krun-init"))
+
 (declare dyld-fallback-path)
 (declare wait-for-tcp!)
 
@@ -531,6 +539,7 @@
                                   "mounts" (mapv (fn [m] {"tag" (:tag m) "host" (:host m)}) mounts)
                                   "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
                                   "exec" exec-cmd
+                                  "init_binary" (krun-init-bin)
                                   "dhcp" true}
                              proc (spawn-runner! project-dir cfg)]
                          (try
@@ -672,7 +681,8 @@
              "rootfs_path" rootfs
              "cpus" (or cpus 1)
              "memory_mib" (or memory-mib 512)
-             "exec" (vec cmd)}
+             "exec" (vec cmd)
+             "init_binary" (krun-init-bin)}
         out-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-out-" (java.util.UUID/randomUUID))
         err-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-err-" (java.util.UUID/randomUUID))
         pb (ProcessBuilder. (vec (concat (prlimit-nofile-argv)
