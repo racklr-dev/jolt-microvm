@@ -1,0 +1,7 @@
+src/
+include/
+*.o
+*.elf
+kernel-probe.c
+kernel-probe_.c
+booter
