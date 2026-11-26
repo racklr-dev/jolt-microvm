@@ -3,6 +3,21 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.7.0 — 2026-11-25
+
+### Added
+
+- Unikernel (bare-metal) example lane: boot a freestanding kernel under
+  `libkrun/boot-external!` with no guest OS — a Linux-ABI C kernel
+  (`linux-abi/`), a Rust `x86_64-unknown-none` kernel (`rust/`), and a Xen
+  PVH probe (`pvh/`), plus `boot.clj` and `build.sh`; see
+  `examples/unikernel/README.md`.
+
+### Changed
+
+- Desktop example README: tighten the VNC/xauth prerequisites and the
+  `nix develop` wording.
+
 ## v1.6.0 — 2026-11-25
 
 ### Added
