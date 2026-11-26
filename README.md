@@ -103,6 +103,44 @@ fetches/builds the devShell closure into `/nix/store`, then it is cached.
   (vm/exec v "gcc --version")          ; the flake's stdenv toolchain
   (vm/exec v "hello"))                 ; a package from the devShell
 ```
+
+## Desktop sandboxes
+
+`jolt.microvm.desktop` adds tiny alpine X11 and Wayland desktops you can look at
+over VNC, and `x11-exec` runs a single X11 app on the host display over ssh -X.
+
+```clojure
+(require '[jolt.microvm :as vm]
+         '[jolt.microvm.desktop :as desktop])
+
+;; full X11 desktop over VNC
+(vm/with-vm [v {:image "alpine:3.20"
+                :project-dir "/path/to/your/project"
+                :packages (desktop/profile :x11)
+                :memory-mib 1024}]
+  (desktop/start-x11! v))   ; => {:ip "10.44.1.20" :port 5900 :url "10.44.1.20:5900"}
+
+;; full Wayland desktop over VNC: use :wayland and desktop/start-wayland!
+
+;; one X11 app on the host display via ssh -X
+(vm/with-vm [v {:image "alpine:3.20"
+                :project-dir "/path/to/your/project"
+                :packages ["xterm" "xauth" "font-noto" "font-misc-misc"]
+                :x11? true}]
+  (vm/x11-exec v "xterm"))
+```
+
+Runnable versions live in `examples/desktop/` (`x11.clj`, `wayland.clj`,
+`x11-app.clj`). The first boot apk-installs the profile into the cached alpine
+base, so it is slow once and fast after. The VNC server listens on the VM's
+per-VM TAP IP, which is reachable only from the host, and has no password. For
+a password or an SSH-tunneled VNC port, edit `src/jolt/microvm/desktop.clj` and
+pass `:tcp-forward? true`.
+
+`:x11?` enables `X11Forwarding` in the guest sshd_config and makes the sandbox
+home writable so sshd can write `~/.Xauthority`. `:tcp-forward?` enables
+`AllowTcpForwarding` for SSH port forwards.
+
 `:arch` overrides the host-architecture default (x86_64→amd64, aarch64→arm64).
 
 Direct-exec for distroless / shell-less images (no SSH, no shell):
@@ -123,6 +161,7 @@ Direct-exec for distroless / shell-less images (no SSH, no shell):
 | `start!` | `opts` | VM handle | throws if `check!` finds an `:error` |
 | `exec` | `vm command & opts` | `{:stdout :stderr :exit}` | throws on timeout |
 | `exec!` | `vm command & opts` | `{:stdout :stderr :exit}` | throws on nonzero exit or timeout |
+| `x11-exec` | `vm command & opts` | `{:stdout :stderr :exit}` | throws on timeout |
 | `alive?` | `vm` | boolean | — |
 | `info` | `vm` | `{:image :port :rootfs :workspace :mounts :running?}` | — |
 | `copy-to!` | `vm host-path guest-path` | nil | throws on scp failure |
@@ -153,6 +192,7 @@ streams output and exits with the guest's status, `run` throws on nonzero,
 - `jolt.microvm.rootfs` — base/prepare, alpine package install, mount + user/key/krun-config injection.
 - `jolt.microvm.keys` — ephemeral + host ed25519 keys via `ssh-keygen`.
 - `jolt.microvm.runner` — the subprocess that boots libkrun with all virtio-fs mounts.
+- `jolt.microvm.desktop` — alpine X11/Wayland desktop profiles served over VNC.
 
 ## Status
 

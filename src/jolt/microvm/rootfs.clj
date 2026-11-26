@@ -150,6 +150,17 @@
       (.setWritable sshd true true)
       (spit (str dir "/authorized_keys") (str pubkey "\n")))))
 
+(defn inject-sshd-config!
+  "Enable X11/TCP forwarding in the session sshd_config by flipping the
+  active `no` lines to `yes`. The base image ships these off by default."
+  [rootfs & {:keys [x11? tcp-forward?]}]
+  (let [f (str rootfs "/etc/ssh/sshd_config")
+        s (if (.exists (java.io.File. f)) (slurp f) "")]
+    (spit f
+      (cond-> s
+        x11?         (str/replace #"(?m)^X11Forwarding no$" "X11Forwarding yes")
+        tcp-forward? (str/replace #"(?m)^AllowTcpForwarding no$" "AllowTcpForwarding yes")))))
+
 (defn sshd-exec-command
   "Build the guest workload args (shell) that mount the virtio-fs tags and run
   sshd. mounts: [{:tag :host :guest}]."

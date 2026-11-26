@@ -217,8 +217,18 @@
 (declare dyld-fallback-path)
 (declare wait-for-tcp!)
 
+(defn- prlimit-nofile-argv
+  "Raise the runner process's host-side file descriptor soft limit on Linux.
+  libkrun's virtio-fs opens host files on behalf of the guest, and a desktop's
+  shared-library graph can exceed the common 1024 soft limit."
+  []
+  (when (str/starts-with? (str/lower-case (or (System/getProperty "os.name") "")) "linux")
+    (when-let [p (which "prlimit")]
+      [p "--nofile=65536:65536" "--"])))
+
 (defn- spawn-runner! [project-dir config]
-  (let [pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str config)])
+  (let [pb (ProcessBuilder. (vec (concat (prlimit-nofile-argv)
+                                          [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str config)])))
         _ (.directory pb (File. project-dir))
         env (.environment pb)
         _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
@@ -481,7 +491,7 @@
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward?] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -508,8 +518,10 @@
         ephemeral (keys/generate-ephemeral!)
         host (keys/generate-host!)
         _ (rootfs/inject-sandbox-user! rootfs)
-        _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? writable-home?)
+        _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? (or writable-home? x11?))
         _ (keys/inject-host! rootfs host)
+        _ (when (or x11? tcp-forward?)
+            (rootfs/inject-sshd-config! rootfs :x11? x11? :tcp-forward? tcp-forward?))
         exec-cmd (rootfs/sshd-exec-command mounts)
         boot-attempt (fn boot-attempt [attempt]
                        (let [net (net-up! cache-dir :egress egress)
@@ -580,6 +592,32 @@
       (throw (ex-info (str (if (:interrupted? r) "interrupted" (str "command failed (" (:exit r) ")")) ": " command) r)))
     r))
 
+(defn x11-exec
+  "Run command in the VM with X11 forwarding to the host display. Blocks until
+  the command exits. Uses a fresh ssh connection (not the ControlMaster mux,
+  which was not started with -X). opts: :trusted? (use -Y instead of -X),
+  :timeout-ms."
+  [vm command & {:keys [trusted? timeout-ms] :or {timeout-ms 300000}}]
+  (let [known (known-hosts-path! (:ip vm) (:host-public-key vm))]
+    (try
+      (let [argv (into-array String
+                    (concat ["ssh" "-i" (:private-key-path vm)
+                             (if trusted? "-Y" "-X")
+                             "-o" "StrictHostKeyChecking=yes"
+                             "-o" (str "UserKnownHostsFile=" known)
+                             "-o" "BatchMode=yes"
+                             "-o" "LogLevel=ERROR"
+                             (str "sandbox@" (:ip vm))
+                             command]))
+            proc (.start (ProcessBuilder. argv))
+            out (future (drain! (.getInputStream proc)))
+            err (future (drain! (.getErrorStream proc)))]
+        (if (.waitFor proc timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
+          {:stdout @out :stderr @err :exit (.exitValue proc)}
+          (do (.destroyForcibly proc)
+              (throw (ex-info "x11 command timed out" {:command command :timeout-ms timeout-ms})))))
+      (finally (.delete (java.io.File. known))))))
+
 (defn alive?
   "True while the VM's runner process is alive."
   [vm]
@@ -637,7 +675,8 @@
              "exec" (vec cmd)}
         out-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-out-" (java.util.UUID/randomUUID))
         err-file (str (System/getProperty "java.io.tmpdir") "/jolt-vm-err-" (java.util.UUID/randomUUID))
-        pb (ProcessBuilder. [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str cfg)])
+        pb (ProcessBuilder. (vec (concat (prlimit-nofile-argv)
+                                          [(jolt-bin) "run" "-m" "jolt.microvm.runner" (json/write-str cfg)])))
         _ (.directory pb (File. project-dir))
         env (.environment pb)
         _ (.put env "JOLT_SKIP_MIN_VERSION" "1")
