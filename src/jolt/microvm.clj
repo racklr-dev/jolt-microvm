@@ -248,7 +248,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix display keyboard])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix display keyboard mouse])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -506,10 +506,16 @@
                  /dev/shm/jolt-vm-<uuid>.keys. Feed keys with send-key!/
                  send-event! on the VM record; the VM record carries the
                  resolved {:path}.
+    :mouse       attach a virtio-input absolute touchscreen (the mouse; see
+                 jolt.libkrun.input/touchscreen-device), sized to the display
+                 frame. Accepts true or {:path}; :path defaults to
+                 /dev/shm/jolt-vm-<uuid>.mouse. Feed it with send-mouse-event!
+                 (BTN_TOUCH/ABS_X/ABS_Y/SYN events); the VM record carries the
+                 resolved {:path :width :height}.
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward? display keyboard] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward? display keyboard mouse] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -558,7 +564,18 @@
                                    (System/getProperty "java.io.tmpdir"))]
                          {:path (or (:path k)
                                     (str shm "/jolt-vm-" (java.util.UUID/randomUUID) ".keys"))}))
+        mouse-cfg (when mouse
+                    (let [m (if (map? mouse) mouse {})
+                          shm (if (.isDirectory (java.io.File. "/dev/shm"))
+                                "/dev/shm"
+                                (System/getProperty "java.io.tmpdir"))
+                          d (or display-cfg {:width 1280 :height 720})]
+                      {:path (or (:path m)
+                                 (str shm "/jolt-vm-" (java.util.UUID/randomUUID) ".mouse"))
+                       :width (int (get m :width (:width d)))
+                       :height (int (get m :height (:height d)))}))
         _ (when keyboard-cfg (spit (:path keyboard-cfg) ""))
+        _ (when mouse-cfg (spit (:path mouse-cfg) ""))
         exec-cmd (rootfs/sshd-exec-command mounts :dri? (boolean display))
         boot-attempt (fn boot-attempt [attempt]
                        (let [net (net-up! cache-dir :egress egress)
@@ -576,14 +593,18 @@
                                                "virgl-flags" (:virgl-flags display-cfg)
                                                "path" (:path display-cfg)})
                                   "keyboard" (when keyboard-cfg
-                                               {"path" (:path keyboard-cfg)})}
+                                               {"path" (:path keyboard-cfg)})
+                                  "mouse" (when mouse-cfg
+                                            {"path" (:path mouse-cfg)
+                                             "width" (:width mouse-cfg)
+                                             "height" (:height mouse-cfg)})}
                              proc (spawn-runner! project-dir cfg)]
                          (try
                            (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
                                  _ (wait-for-tcp! ip 22 30000)]
                              (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
                                    proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
-                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved display-cfg keyboard-cfg))
+                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved display-cfg keyboard-cfg mouse-cfg))
                            (catch Exception e
                              (.destroyForcibly proc)
                              (net-down! net)
@@ -600,9 +621,13 @@
 ;; no byte-order contract.
 (def ^:private ev-syn 0)
 (def ^:private ev-key 1)
+(def ^:private ev-abs 3)
 (def ^:private syn-report 0)
+(def ^:private btn-touch 0x14a)
+(def ^:private abs-x 0)
+(def ^:private abs-y 1)
 
-(defn- append-key-event! [path type code value]
+(defn- append-input-event! [path type code value]
   (with-open [w (java.io.FileOutputStream. path true)]
     (.write w (.getBytes (str type " " code " " value "\n") "UTF-8"))))
 
@@ -612,7 +637,7 @@
   e.g. EV_KEY=1, EV_SYN=0. Returns true when the VM has a keyboard."
   [vm {:keys [type code value]}]
   (when-let [path (get-in vm [:keyboard :path])]
-    (append-key-event! path (long type) (long code) (long value))
+    (append-input-event! path (long type) (long code) (long value))
     true))
 
 (defn send-key!
@@ -622,6 +647,16 @@
   [vm code pressed?]
   (send-event! vm {:type ev-key :code code :value (if pressed? 1 0)})
   (send-event! vm {:type ev-syn :code syn-report :value 0}))
+
+(defn send-mouse-event!
+  "Enqueue one Linux input event for the VM's virtual touchscreen/mouse
+  (requires the VM to have been started with :mouse). :type :code :value are
+  integers — e.g. EV_KEY/BTN_TOUCH, EV_ABS/ABS_X, EV_SYN/SYN_REPORT. Returns
+  true when the VM has a mouse."
+  [vm {:keys [type code value]}]
+  (when-let [path (get-in vm [:mouse :path])]
+    (append-input-event! path (long type) (long code) (long value))
+    true))
 
 (defn- shq
   "Single-quote a string for embedding in a shell command, escaping embedded
