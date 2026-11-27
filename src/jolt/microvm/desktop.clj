@@ -21,7 +21,7 @@
   ;; xorg-server lives in the community repo (already enabled in the alpine base)
   ;; and bundles the modesetting driver (p:xf86-video-modesetting).
   {:x11     ["xorg-server" "openbox" "xterm" "font-noto" "font-misc-misc" "xeyes"]
-   :wayland ["sway" "swaybg" "xwayland" "foot" "font-dejavu"]})
+   :wayland ["seatd" "sway" "swaybg" "xwayland" "foot" "font-dejavu"]})
 
 (defn profile
   "Return the apk package list for a desktop profile keyword."
@@ -43,6 +43,9 @@ echo x11-ready")
 (def ^:private wayland-script
   "mkdir -p /tmp/xdg
 chmod 700 /tmp/xdg
+setsid seatd >/tmp/seatd.log 2>&1 &
+i=0
+while [ $i -lt 10 ]; do [ -S /run/seatd.sock ] && break; sleep 1; i=$((i+1)); done
 cat >/tmp/sway.conf <<'EOF'
 output * {
   bg #000000 solid_color
@@ -51,15 +54,17 @@ exec foot
 EOF
 export XDG_RUNTIME_DIR=/tmp/xdg
 export WLR_BACKENDS=drm
+export WLR_RENDERER=pixman
 export WLR_LIBINPUT_NO_DEVICES=1
 export XDG_SESSION_TYPE=wayland
+export LIBSEAT_BACKEND=seatd
 setsid sway -c /tmp/sway.conf >/tmp/sway.log 2>&1 &
 i=0
 while [ $i -lt 30 ]; do
   if ls /tmp/xdg/wayland-* >/dev/null 2>&1; then break; fi
   sleep 1; i=$((i+1))
 done
-if ! ls /tmp/xdg/wayland-* >/dev/null 2>&1; then cat /tmp/sway.log >&2; exit 1; fi
+if ! ls /tmp/xdg/wayland-* >/dev/null 2>&1; then cat /tmp/seatd.log /tmp/sway.log >&2; exit 1; fi
 echo wayland-ready")
 
 (defn- display-info
