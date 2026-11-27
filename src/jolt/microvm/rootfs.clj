@@ -163,8 +163,10 @@
 
 (defn sshd-exec-command
   "Build the guest workload args (shell) that mount the virtio-fs tags and run
-  sshd. mounts: [{:tag :host :guest}]."
-  [mounts & {:keys [sshd] :or {sshd "/usr/sbin/sshd"}}]
+  sshd. mounts: [{:tag :host :guest}]. When :dri? is true, make any DRM device
+  world-writable first, so the sandbox user (not root) can open the virtio-gpu
+  scanout for a desktop."
+  [mounts & {:keys [sshd dri?] :or {sshd "/usr/sbin/sshd"}}]
   (let [mount-cmds (str/join " && "
                              (map #(str "mkdir -p " (:guest %) " && mount -t virtiofs "
                                         (when (:readonly? %) "-o ro ")
@@ -174,9 +176,12 @@
         ;; a workspace/mount whose guest path lives under /tmp is created by
         ;; `mkdir -p` and then mounted-over — if the /tmp tmpfs landed after,
         ;; it would shadow that mount and `cd` to it fails (exit 2, empty out).
+        dri-setup (when dri?
+                    " && for d in /dev/dri/card* /dev/dri/renderD*; do [ -e \"$d\" ] && chmod 666 \"$d\"; done")
         cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"
                  " && mount -t tmpfs -o mode=1777 tmpfs /tmp "
                  " && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
                  (when (seq mount-cmds) (str " && " mount-cmds))
-                 "&& exec " sshd " -D -e -o StrictModes=no")]
+                 (or dri-setup "")
+                 " && exec " sshd " -D -e -o StrictModes=no")]
     ["/bin/sh" "-c" cmd]))

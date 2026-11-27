@@ -12,7 +12,10 @@
          :git/sha "7b9874f3e0302b03e28713531e1ad73a796deef6"}
         jolt-lang/jolt-libkrun
         {:git/url "https://github.com/racklr-dev/jolt-libkrun"
-         :git/sha "f27dbf15de4ad8e782d238ac56324b26f0fa50b0"}
+         :git/sha "0bd36cd54f35d4898bb76f26ee2e29b478e11a6f"}
+        jolt-lang/jolt-framebuffer
+        {:git/url "https://github.com/racklr-dev/jolt-framebuffer"
+         :git/sha "5c50e7f6c5f164eec91e051eac5398e50a35e389"}
         jolt-lang/jolt-pty
         {:git/url "https://github.com/racklr-dev/jolt-pty"
          :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}

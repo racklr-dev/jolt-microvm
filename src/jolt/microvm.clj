@@ -248,7 +248,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix display])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -496,10 +496,15 @@
                  domains (+subdomains) and sinkholes the rest, nftables default-
                  denies the guest subnet except DNS + those ports, and NAT
                  masquerades the allowed egress out the host's route
+    :display     attach a virtio-gpu device and write presented frames to a
+                 PPM file (see jolt.libkrun.display). Accepts true (default
+                 1280x720) or {:width :height :virgl-flags :path}; :path
+                 defaults to /dev/shm/jolt-vm-<uuid>.ppm. The VM record
+                 carries the resolved {:width :height :virgl-flags :path}.
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward?] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward? display] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -530,7 +535,17 @@
         _ (keys/inject-host! rootfs host)
         _ (when (or x11? tcp-forward?)
             (rootfs/inject-sshd-config! rootfs :x11? x11? :tcp-forward? tcp-forward?))
-        exec-cmd (rootfs/sshd-exec-command mounts)
+        display-cfg (when display
+                      (let [d (if (map? display) display {})
+                            shm (if (.isDirectory (java.io.File. "/dev/shm"))
+                                  "/dev/shm"
+                                  (System/getProperty "java.io.tmpdir"))]
+                        {:width (int (get d :width 1280))
+                         :height (int (get d :height 720))
+                         :virgl-flags (int (get d :virgl-flags 1))
+                         :path (or (:path d)
+                                   (str shm "/jolt-vm-" (java.util.UUID/randomUUID) ".ppm"))}))
+        exec-cmd (rootfs/sshd-exec-command mounts :dri? (boolean display))
         boot-attempt (fn boot-attempt [attempt]
                        (let [net (net-up! cache-dir :egress egress)
                              cfg {"rootfs_path" rootfs
@@ -540,14 +555,19 @@
                                   "net_taps" [{"id" "eth0" "tap" (:tap net) "mac" (mapv int (:mac-bytes net))}]
                                   "exec" exec-cmd
                                   "init_binary" (krun-init-bin)
-                                  "dhcp" true}
+                                  "dhcp" true
+                                  "display" (when display-cfg
+                                              {"width" (:width display-cfg)
+                                               "height" (:height display-cfg)
+                                               "virgl-flags" (:virgl-flags display-cfg)
+                                               "path" (:path display-cfg)})}
                              proc (spawn-runner! project-dir cfg)]
                          (try
                            (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
                                  _ (wait-for-tcp! ip 22 30000)]
                              (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
                                    proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
-                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved))
+                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved display-cfg))
                            (catch Exception e
                              (.destroyForcibly proc)
                              (net-down! net)
