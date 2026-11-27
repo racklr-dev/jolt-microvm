@@ -248,7 +248,7 @@
         p (.start pb)]
     p))
 
-(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix display])
+(defrecord VM [image cache-dir rootfs ip private-key-path host-public-key process workspace opts mounts tap mac lease-file pid-file table subnet egress-iface nix display keyboard])
 
 ;; -- auto-seed ----------------------------------------------------------------
 (defn- with-base-lock! [path f]
@@ -501,10 +501,15 @@
                  1280x720) or {:width :height :virgl-flags :path}; :path
                  defaults to /dev/shm/jolt-vm-<uuid>.ppm. The VM record
                  carries the resolved {:width :height :virgl-flags :path}.
+    :keyboard    attach a virtio-input keyboard (see jolt.libkrun.input).
+                 Accepts true or {:path}; :path defaults to
+                 /dev/shm/jolt-vm-<uuid>.keys. Feed keys with send-key!/
+                 send-event! on the VM record; the VM record carries the
+                 resolved {:path}.
     :cpus :memory-mib :ssh-port (0 = ephemeral)
     :project-dir dir whose deps.edn provides jolt-microvm + deps
   Returns a VM record."
-  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward? display] :as opts}]
+  [{:keys [image workspace cache-dir cpus memory-mib project-dir packages mounts arch writable-home? workspace-guest nix-flake egress x11? tcp-forward? display keyboard] :as opts}]
   (check-or-throw!)
   (let [cache-dir (or cache-dir (str (System/getProperty "user.home") "/.cache/jolt-microvm"))
         declared (when project-dir (guest-deps/guest-deps project-dir))
@@ -546,6 +551,14 @@
                          :virgl-flags (int (get d :virgl-flags 1))
                          :path (or (:path d)
                                    (str shm "/jolt-vm-" (java.util.UUID/randomUUID) ".ppm"))}))
+        keyboard-cfg (when keyboard
+                       (let [k (if (map? keyboard) keyboard {})
+                             shm (if (.isDirectory (java.io.File. "/dev/shm"))
+                                   "/dev/shm"
+                                   (System/getProperty "java.io.tmpdir"))]
+                         {:path (or (:path k)
+                                    (str shm "/jolt-vm-" (java.util.UUID/randomUUID) ".keys"))}))
+        _ (when keyboard-cfg (spit (:path keyboard-cfg) ""))
         exec-cmd (rootfs/sshd-exec-command mounts :dri? (boolean display))
         boot-attempt (fn boot-attempt [attempt]
                        (let [net (net-up! cache-dir :egress egress)
@@ -561,14 +574,16 @@
                                               {"width" (:width display-cfg)
                                                "height" (:height display-cfg)
                                                "virgl-flags" (:virgl-flags display-cfg)
-                                               "path" (:path display-cfg)})}
+                                               "path" (:path display-cfg)})
+                                  "keyboard" (when keyboard-cfg
+                                               {"path" (:path keyboard-cfg)})}
                              proc (spawn-runner! project-dir cfg)]
                          (try
                            (let [ip (net/wait-lease (:lease-file net) (:mac-str net) 60000)
                                  _ (wait-for-tcp! ip 22 30000)]
                              (->VM image cache-dir rootfs ip (:private-key-path ephemeral) (:public-key host)
                                    proc ws opts mounts (:tap net) (:mac-str net) (:lease-file net) (:pid-file net)
-                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved display-cfg))
+                                   (:table net) (:subnet net) (:egress-iface net) nix-resolved display-cfg keyboard-cfg))
                            (catch Exception e
                              (.destroyForcibly proc)
                              (net-down! net)
@@ -577,6 +592,36 @@
                                (boot-attempt (inc attempt))
                                (throw e))))))]
     (boot-attempt 1)))
+
+;; -- keyboard injection ------------------------------------------------------
+;; The runner process owns the virtio-input device (send-event! lives there);
+;; the host side appends one event per line to the VM's keyboard file and the
+;; runner's poller forwards it. Text keeps the boundary debuggable and needs
+;; no byte-order contract.
+(def ^:private ev-syn 0)
+(def ^:private ev-key 1)
+(def ^:private syn-report 0)
+
+(defn- append-key-event! [path type code value]
+  (with-open [w (java.io.FileOutputStream. path true)]
+    (.write w (.getBytes (str type " " code " " value "\n") "UTF-8"))))
+
+(defn send-event!
+  "Enqueue one Linux input event for the VM's virtual keyboard (requires the
+  VM to have been started with :keyboard). :type :code :value are integers —
+  e.g. EV_KEY=1, EV_SYN=0. Returns true when the VM has a keyboard."
+  [vm {:keys [type code value]}]
+  (when-let [path (get-in vm [:keyboard :path])]
+    (append-key-event! path (long type) (long code) (long value))
+    true))
+
+(defn send-key!
+  "Press (pressed? -> value 1) or release (value 0) a Linux key code on the
+  VM's virtual keyboard, plus a trailing EV_SYN/SYN_REPORT — the same shape as
+  jolt.libkrun.input/send-key!."
+  [vm code pressed?]
+  (send-event! vm {:type ev-key :code code :value (if pressed? 1 0)})
+  (send-event! vm {:type ev-syn :code syn-report :value 0}))
 
 (defn- shq
   "Single-quote a string for embedding in a shell command, escaping embedded

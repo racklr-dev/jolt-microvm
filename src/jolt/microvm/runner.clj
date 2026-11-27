@@ -9,8 +9,10 @@
 ;; (the bench canvas) never observes a half-written frame.
 (ns jolt.microvm.runner
   (:require [jolt.libkrun :as krun]
+            [jolt.libkrun.input :as input]
             [jolt.framebuffer :as fb]
-            [clojure.data.json :as json]))
+            [clojure.data.json :as json]
+            [clojure.string :as str]))
 
 (defn- ppm-sink
   "Return a display sink that writes each frame to `path` as a P6 binary PPM.
@@ -25,6 +27,38 @@
         (java.nio.file.Files/move tmp p
           (into-array java.nio.file.CopyOption
                       [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn- poll-keys!
+  "Tail the keyboard file — one '<type> <code> <value>' event per line,
+  appended by the host — and forward each complete line to the in-process
+  virtio-input device via jolt.libkrun.input/send-event!. Runs on a thread
+  until stop? is set (after vmm_run returns)."
+  [path stop?]
+  (future
+    (let [off (atom 0)
+          pending (atom "")]
+      (loop []
+        (try
+          (let [len (.length (java.io.File. path))]
+            (when (> len @off)
+              (let [n (- len @off)
+                    buf (byte-array n)]
+                (with-open [raf (java.io.RandomAccessFile. path "r")]
+                  (.seek raf @off)
+                  (.readFully raf buf))
+                (reset! off len)
+                (let [txt (str @pending (String. buf "UTF-8"))
+                      lines (str/split txt #"\n" -1)]
+                  (doseq [line (butlast lines)]
+                    (let [p (str/split (str/trim line) #"\s+")]
+                      (when (= 3 (count p))
+                        (input/send-event! {:type (Long/parseLong (nth p 0))
+                                            :code (Long/parseLong (nth p 1))
+                                            :value (Long/parseLong (nth p 2))}))))
+                  (reset! pending (last lines))))))
+          (catch Exception _))
+        (Thread/sleep 5)
+        (if-not @stop? (recur) nil)))))
 
 (defn -main [& args]
   (let [cfg (json/read-str (first args))
@@ -42,8 +76,14 @@
                   {:width (int (get display-cfg "width" 1280))
                    :height (int (get display-cfg "height" 720))
                    :virgl-flags (int (get display-cfg "virgl-flags" 1))
-                   :sink (ppm-sink (get display-cfg "path"))})]
-    (krun/boot! {:rootfs rootfs :cpus cpus :memory-mib memory-mib
-                 :mounts mounts :net-taps net-taps :exec exec :dhcp dhcp
-                 :init-binary (get cfg "init_binary")
-                 :display display})))
+                   :sink (ppm-sink (get display-cfg "path"))})
+        keyboard-path (get-in cfg ["keyboard" "path"])
+        stop? (atom false)
+        _ (when keyboard-path (poll-keys! keyboard-path stop?))]
+    (try
+      (krun/boot! {:rootfs rootfs :cpus cpus :memory-mib memory-mib
+                   :mounts mounts :net-taps net-taps :exec exec :dhcp dhcp
+                   :init-binary (get cfg "init_binary")
+                   :display display
+                   :keyboard? (boolean keyboard-path)})
+      (finally (reset! stop? true)))))
