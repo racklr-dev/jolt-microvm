@@ -170,9 +170,13 @@
                                         (when (:readonly? %) "-o ro ")
                                         (:tag %) " " (:guest %))
                                   mounts))
+        ;; tmpfs /tmp and /var/empty must mount BEFORE the virtiofs mounts:
+        ;; a workspace/mount whose guest path lives under /tmp is created by
+        ;; `mkdir -p` and then mounted-over — if the /tmp tmpfs landed after,
+        ;; it would shadow that mount and `cd` to it fails (exit 2, empty out).
         cmd (str "mount -t tmpfs tmpfs /run && mkdir -p /run/sshd"
-                 (when (seq mount-cmds) (str " && " mount-cmds))
                  " && mount -t tmpfs -o mode=1777 tmpfs /tmp "
                  " && mount -t tmpfs -o uid=0,gid=0,mode=0755 tmpfs /var/empty "
+                 (when (seq mount-cmds) (str " && " mount-cmds))
                  "&& exec " sshd " -D -e -o StrictModes=no")]
     ["/bin/sh" "-c" cmd]))

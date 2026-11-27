@@ -3,6 +3,16 @@
 jolt-microvm is pinned by git SHA in downstream deps.edn files; tags are the
 release markers. New work lands on `main` and is released by tagging.
 
+## v1.7.1 — 2026-11-26
+
+### Fixed
+
+- Guest boot mounts `tmpfs` on `/tmp` and `/var/empty` BEFORE the virtiofs
+  mounts, so a `:workspace-guest` (or any mount) whose path lives under `/tmp`
+  is no longer shadowed by the later `/tmp` tmpfs — `cd` into it now works
+  instead of failing with exit 2 and empty output. Regression test:
+  `test/jolt/workspace_guest_tmp_test.clj`.
+
 ## v1.7.0 — 2026-11-25
 
 ### Added
