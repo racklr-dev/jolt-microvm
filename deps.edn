@@ -15,7 +15,7 @@
          :git/sha "0bd36cd54f35d4898bb76f26ee2e29b478e11a6f"}
         jolt-lang/jolt-framebuffer
         {:git/url "https://github.com/racklr-dev/jolt-framebuffer"
-         :git/sha "5c50e7f6c5f164eec91e051eac5398e50a35e389"}
+         :git/sha "82c9e464fd07ed5e17f59cd88cee3d10cf2ef003"}
         jolt-lang/jolt-pty
         {:git/url "https://github.com/racklr-dev/jolt-pty"
          :git/sha "5c0c045ddf8e10b341ffe42efefa894db1545ebe"}
