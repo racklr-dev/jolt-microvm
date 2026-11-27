@@ -150,6 +150,17 @@
       (.setWritable sshd true true)
       (spit (str dir "/authorized_keys") (str pubkey "\n")))))
 
+(defn inject-root-authorized-keys!
+  "Write the client public key into root's authorized_keys, so exec can run as
+  root (:root? true). The desktop needs root to run Xorg/sway — rootless Xorg
+  still wants /dev/tty0, which a virtio-gpu scanout guest has no VT for. The
+  guest sshd already runs with StrictModes=no, so the chowned-to-sandbox
+  ownership of /root does not block key auth."
+  [rootfs pubkey]
+  (let [dir (str rootfs "/root/.ssh")]
+    (.mkdirs (java.io.File. dir))
+    (spit (str dir "/authorized_keys") (str pubkey "\n"))))
+
 (defn inject-sshd-config!
   "Enable X11/TCP forwarding in the session sshd_config by flipping the
   active `no` lines to `yes`. The base image ships these off by default."

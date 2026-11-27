@@ -152,12 +152,12 @@
     (spit known (str host " " host-public-key "\n"))
     known))
 
-(defn- ssh-control-path [host]
-  (str (System/getProperty "java.io.tmpdir") "/jolt-ssh-ctl-" host))
+(defn- ssh-control-path [user host]
+  (str (System/getProperty "java.io.tmpdir") "/jolt-ssh-ctl-" user "-" host))
 
-(defn- ssh-mux-args [host]
+(defn- ssh-mux-args [user host]
   ["-o" "ControlMaster=auto"
-   "-o" (str "ControlPath=" (ssh-control-path host))
+   "-o" (str "ControlPath=" (ssh-control-path user host))
    "-o" "ControlPersist=120"])
 
 (defn ssh-exec
@@ -167,8 +167,8 @@
   :interrupt (an atom polled while the command runs; when truthy the ssh
   process is killed and the result carries :interrupted? true),
   :interrupt-poll-ms (default 50)."
-  [host private-key-path host-public-key command & {:keys [timeout-ms interrupt interrupt-poll-ms]
-                                                    :or {timeout-ms 300000 interrupt-poll-ms 50}}]
+  [host private-key-path host-public-key command & {:keys [timeout-ms interrupt interrupt-poll-ms user]
+                                                    :or {timeout-ms 300000 interrupt-poll-ms 50 user "sandbox"}}]
   (let [known (known-hosts-path! host host-public-key)]
     (try
       (let [argv (into-array String (concat ["ssh" "-i" private-key-path
@@ -177,8 +177,8 @@
                                              "-o" "BatchMode=yes"
                                              "-o" "ConnectTimeout=10"
                                              "-o" "LogLevel=ERROR"]
-                                            (ssh-mux-args host)
-                                            [(str "sandbox@" host) command]))
+                                            (ssh-mux-args user host)
+                                            [(str user "@" host) command]))
             proc (.start (ProcessBuilder. argv))
             out (future (drain! (.getInputStream proc)))
             err (future (drain! (.getErrorStream proc)))]
@@ -188,7 +188,7 @@
               ;; ssh exit 255 = connection failure. Drop the persistent
               ;; control socket so the next exec does not reuse a dead mux.
               (when (= 255 (:exit r))
-                (.delete (java.io.File. (ssh-control-path host))))
+                (.delete (java.io.File. (ssh-control-path user host))))
               r)
             (cond
               (and interrupt @interrupt)
@@ -532,6 +532,7 @@
         host (keys/generate-host!)
         _ (rootfs/inject-sandbox-user! rootfs)
         _ (rootfs/inject-authorized-keys! rootfs (:public-key ephemeral) :writable-home? (or writable-home? x11?))
+        _ (rootfs/inject-root-authorized-keys! rootfs (:public-key ephemeral))
         _ (keys/inject-host! rootfs host)
         _ (when (or x11? tcp-forward?)
             (rootfs/inject-sshd-config! rootfs :x11? x11? :tcp-forward? tcp-forward?))
@@ -606,17 +607,20 @@
   "Run a command in the VM. Returns {:stdout :stderr :exit}, plus
   :interrupted? true when an :interrupt atom fired.
   opts: :cwd (default the workspace's guest path), :timeout-ms (default 300000),
-  :interrupt (atom), :interrupt-poll-ms."
-  [vm command & {:keys [cwd timeout-ms interrupt interrupt-poll-ms] :or {timeout-ms 300000}}]
+  :interrupt (atom), :interrupt-poll-ms, :root? (run as root instead of the
+  sandbox user)."
+  [vm command & {:keys [cwd timeout-ms interrupt interrupt-poll-ms root?] :or {timeout-ms 300000}}]
   (ssh-exec (:ip vm) (:private-key-path vm) (:host-public-key vm)
             (exec-command vm command cwd)
-            :timeout-ms timeout-ms :interrupt interrupt :interrupt-poll-ms interrupt-poll-ms))
+            :timeout-ms timeout-ms :interrupt interrupt :interrupt-poll-ms interrupt-poll-ms
+            :user (if root? "root" "sandbox")))
 
 (defn exec!
   "Like exec but throws ex-info when the command exits non-zero (ex-data carries
-  :stdout/:stderr/:exit) or is interrupted. Returns the result on success."
-  [vm command & {:keys [cwd timeout-ms] :or {timeout-ms 300000}}]
-  (let [r (exec vm command :cwd cwd :timeout-ms timeout-ms)]
+  :stdout/:stderr/:exit) or is interrupted. Returns the result on success.
+  opts: :cwd, :timeout-ms, :root? (run as root)."
+  [vm command & {:keys [cwd timeout-ms root?] :or {timeout-ms 300000}}]
+  (let [r (exec vm command :cwd cwd :timeout-ms timeout-ms :root? root?)]
     (when-not (zero? (or (:exit r) 1))
       (throw (ex-info (str (if (:interrupted? r) "interrupted" (str "command failed (" (:exit r) ")")) ": " command) r)))
     r))
